@@ -38,6 +38,23 @@ type cache struct {
 	daemonsetLister  appslister.DaemonSetLister
 	stsLister        appslister.StatefulSetLister
 	hpaLister        autoscalinglister.HorizontalPodAutoscalerLister
+
+	client kubernetes.Interface
+}
+
+// some pods on the node, but it is not compute the alloc for scheduler, so need ignore. or  we may see some sum(requests)> nodeAllocatable
+// staging/src/k8s.io/kubectl/pkg/describe/describe.go:3497
+// pkg/scheduler/scheduler.go:500
+// pkg/scheduler/factory.go
+func FilterPendingFailedPods(pods []*v1.Pod) []*v1.Pod {
+	var result []*v1.Pod
+	for _, pod := range pods {
+		if pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
+			continue
+		}
+		result = append(result, pod)
+	}
+	return result
 }
 
 func (c *cache) GetStatefulSets() []*appsv1.StatefulSet {

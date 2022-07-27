@@ -31,6 +31,15 @@ import (
 type CloudConfig struct {
 	Credentials   `name:"credentials" value:"optional"`
 	ClientProfile `name:"clientProfile" value:"optional"`
+	StsConfig     `name:"stsConfig" value:"optional"`
+}
+
+type StsConfig struct {
+	Enable       bool
+	Uin          string
+	StsSecretId  string
+	StsSecretKey string
+	Endpoint     string
 }
 
 // Credentials use user defined SecretId and SecretKey
@@ -49,6 +58,7 @@ type ClientProfile struct {
 	Region                string
 	DomainSuffix          string
 	Scheme                string
+	LocalTKE              bool
 }
 
 type qcloudKey struct {
@@ -98,7 +108,7 @@ var _ cloud.Cloud = &TencentCloud{}
 type TencentCloud struct {
 	cache cache.Cache
 	cvm   *sdkcvm.CVMClient
-	tke   *sdktke.TKEClient
+	tke   sdktke.TKE
 
 	priceConfig *cloud.PriceConfig
 
@@ -115,12 +125,63 @@ type TencentCloud struct {
 
 	eksPlatformer *EKSPlatform
 	tkePlatformer *TKEPlatform
-	eksConverter  Pod2EKSSpecConverter
+}
+
+func (q *TencentCloud) ServerlessPodPriceByContext(param cloud.ResourceParam) (*cloud.Pod, error) {
+	panic("implement me")
+}
+
+func (tc *TencentCloud) Pod2ServerlessSpecByContext(pod *v1.Pod, param cloud.PodSpecConverterParam) spec.CloudPodSpec {
+	machineType := EKSPodCpuType(pod)
+	exists, gpuType := EKSPodGpuType(pod)
+	if exists {
+		machineType = gpuType
+	}
+	if param.Enable {
+		machineType = param.MachineType
+	}
+	qosClass := qos.GetPodQOS(pod)
+
+	reqs := make(v1.ResourceList)
+	lims := make(v1.ResourceList)
+	resourceList, realChargeMode, err := tc.tke.Pod2EKSSpecByContext(pod, sdktke.PodSpecConverterParam{
+		Enable:          param.Enable,
+		ChargeTypeForce: param.ChargeTypeForce,
+		ChargeType:      param.ChargeType,
+		MachineType:     param.MachineType,
+		RawCpu:          param.RawCpu,
+		RawMem:          param.RawMem,
+		RawGPU:          param.RawGPU,
+	})
+	if err != nil {
+		klog.Errorf("Failed to convert pod %v to eks spec: %v, use default sum way", klog.KObj(pod), err)
+	}
+	for name, value := range resourceList {
+		reqs[name] = value
+		lims[name] = value
+	}
+	return spec.CloudPodSpec{
+		PodRef:        pod,
+		Cpu:           reqs[v1.ResourceCPU],
+		Mem:           reqs[v1.ResourceMemory],
+		CpuLimit:      lims[v1.ResourceCPU],
+		MemLimit:      lims[v1.ResourceMemory],
+		GoodsNum:      1,
+		TimeSpan:      3600,
+		MachineArch:   machineType,
+		Serverless:    true,
+		QoSClass:      qosClass,
+		PodChargeType: realChargeMode,
+	}
 }
 
 func NewTencentCloud(qcloudConf *qcloudsdk.QCloudClientConfig, config *cloud.PriceConfig, cache cache.Cache) cloud.Cloud {
 	cvmClient := sdkcvm.NewCVMClient(qcloudConf)
 	tkeClient := sdktke.NewTKEClient(qcloudConf)
+	if qcloudConf.LocalTKE {
+		klog.Infof("use local tke")
+		tkeClient = sdktke.NewTKELocalClient(qcloudConf)
+	}
 	return &TencentCloud{
 		cvm:             cvmClient,
 		tke:             tkeClient,
@@ -130,7 +191,6 @@ func NewTencentCloud(qcloudConf *qcloudsdk.QCloudClientConfig, config *cloud.Pri
 		instances:       make(map[string]*sdkcvm.QCloudInstancePrice),
 		eksPlatformer:   &EKSPlatform{},
 		tkePlatformer:   &TKEPlatform{},
-		eksConverter:    tkeClient,
 	}
 }
 
@@ -193,9 +253,13 @@ func (tc *TencentCloud) ServerlessPodPrice(spec spec.CloudPodSpec) (*cloud.Pod, 
 
 	var cost, discountCost float64
 	// price unit is cent
-	if price.Response != nil && price.Response.Cost != nil {
-		discountCost = float64(*price.Response.Cost) / 100.
-		cost = float64(*price.Response.TotalCost) / 100.
+	if price != nil && price.TotalCost != nil {
+		//pricebytes, _ := json.Marshal(price)
+		//klog.Infof("price: %v", string(pricebytes))
+		cost = float64(*price.TotalCost) / 100.
+	}
+	if price != nil && price.Cost != nil {
+		discountCost = float64(*price.Cost) / 100.
 	}
 	newCnode := &cloud.Pod{
 		BaseInstancePrice: cloud.BaseInstancePrice{
@@ -365,7 +429,7 @@ func (tc *TencentCloud) Pod2ServerlessSpec(pod *v1.Pod) spec.CloudPodSpec {
 		lims[v1.ResourceCPU] = *cores
 		lims[v1.ResourceMemory] = *memorySize
 	} else {
-		resourceList, err := tc.eksConverter.Pod2EKSSpecConverter(pod)
+		resourceList, err := tc.tke.Pod2EKSSpecConverter(pod)
 		if err != nil {
 			klog.Errorf("Failed to convert pod %v to eks spec: %v, use default sum way", klog.KObj(pod), err)
 		}
@@ -397,19 +461,11 @@ func (tc *TencentCloud) Pod2Spec(pod *v1.Pod) spec.CloudPodSpec {
 		machineType = gpuType
 	}
 	qosClass := qos.GetPodQOS(pod)
-	if qosClass == v1.PodQOSBestEffort {
-		// BestEffort is 1C2G in eks by default
-		memorySize := resource.NewQuantity(2*1024*1024*1024, resource.BinarySI)
-		cores := resource.NewMilliQuantity(1000, resource.DecimalSI)
-		reqs[v1.ResourceCPU] = *cores
-		reqs[v1.ResourceMemory] = *memorySize
-		lims[v1.ResourceCPU] = *cores
-		lims[v1.ResourceMemory] = *memorySize
-	}
+
 	if tc.IsServerlessPod(pod) {
 		isServerless = true
 		if qosClass != v1.PodQOSBestEffort {
-			resourceList, err := tc.eksConverter.Pod2EKSSpecConverter(pod)
+			resourceList, err := tc.tke.Pod2EKSSpecConverter(pod)
 			if err != nil {
 				klog.Errorf("Failed to convert pod %v to eks spec: %v, use default sum way", klog.KObj(pod), err)
 			}

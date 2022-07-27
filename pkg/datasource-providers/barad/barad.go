@@ -1,4 +1,4 @@
-package qcloudmonitor
+package barad
 
 import (
 	"context"
@@ -6,73 +6,44 @@ import (
 	"strings"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/klog/v2"
-
 	"github.com/gocrane/crane/pkg/common"
-	"github.com/gocrane/fadvisor/pkg/cloudsdk/qcloud"
-	qconsts "github.com/gocrane/fadvisor/pkg/cloudsdk/qcloud/consts"
-	"github.com/gocrane/fadvisor/pkg/cloudsdk/qcloud/credential"
 	"github.com/gocrane/fadvisor/pkg/cloudsdk/qcloud/qmonitor"
 	"github.com/gocrane/fadvisor/pkg/consts"
 	"github.com/gocrane/fadvisor/pkg/datasource"
 	"github.com/gocrane/fadvisor/pkg/metricnaming"
 	"github.com/gocrane/fadvisor/pkg/metricquery"
 	"github.com/gocrane/fadvisor/pkg/querybuilder"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 const (
 	DefaultStep = 1 * time.Minute
 )
 
-var _ datasource.Interface = &qcloudmonitor{}
+var _ datasource.Interface = &barad{}
 
-type qcloudmonitor struct {
+type barad struct {
 	cmClient *qmonitor.QCloudMonitorClient
 	step     time.Duration
 }
 
-// NewProvider return a QCloud Monitor data provider
-func NewProvider(config *datasource.QCloudMonitorConfig) (datasource.Interface, error) {
-	cm := &qcloudmonitor{}
-	var cred credential.QCloudCredential
-	if config.StsConfig.Enable {
-		cred = credential.NewSTSCredential(config.Region, config.ClusterId, config.AppId, config.Uin, config.StsSecretId, config.StsSecretKey, config.Endpoint, 1*time.Hour)
-	} else {
-		cred = credential.NewQCloudCredential(config.ClusterId, config.AppId, config.SecretId, config.SecretKey, 1*time.Hour)
-	}
-	qcp := qcloud.QCloudClientProfile{
-		Region:          config.Region,
-		DomainSuffix:    config.DomainSuffix,
-		Scheme:          config.Scheme,
-		DefaultLimit:    config.DefaultLimit,
-		DefaultLanguage: config.DefaultLanguage,
-		DefaultTimeout:  time.Duration(config.DefaultTimeoutSeconds) * time.Second,
-		Debug:           config.Debug,
-	}
-	klog.Infof("%+v", qcp)
-	qclouClientConf := &qcloud.QCloudClientConfig{
-		DefaultRetryCnt:     qconsts.MAXRETRY,
-		Credential:          cred,
-		QCloudClientProfile: qcp,
-		RateLimiter:         flowcontrol.NewTokenBucketRateLimiter(10, 20),
-	}
-	cm.cmClient = qmonitor.NewQCloudMonitorClient(qclouClientConf)
-	cm.step = DefaultStep
+// NewProvider return a internal barad data provider; doggy, must for container view must has container id & pod id, must has all dimensions, and different with qcloud monitor
+func NewProvider(config *datasource.BaradConfig) (datasource.Interface, error) {
+	cm := &barad{}
+
 	return cm, nil
 }
 
-func (qm *qcloudmonitor) Name() string {
-	return "qcloudmonitor"
+func (qm *barad) Name() string {
+	return "barad"
 }
 
-func (qm *qcloudmonitor) EnableDebug() {
+func (qm *barad) EnableDebug() {
 	qm.cmClient.EnableDebug()
 }
 
-func (qm *qcloudmonitor) QueryLatestTimeSeries(ctx context.Context, metricNamer metricnaming.MetricNamer) ([]*common.TimeSeries, error) {
+func (qm *barad) QueryLatestTimeSeries(ctx context.Context, metricNamer metricnaming.MetricNamer) ([]*common.TimeSeries, error) {
 	builder := metricNamer.QueryBuilder().Builder(metricquery.QCloudMonitorMetricSource)
 	if builder == nil {
 		return nil, fmt.Errorf("nil builder for %v", metricNamer.BuildUniqueKey())
@@ -86,7 +57,7 @@ func (qm *qcloudmonitor) QueryLatestTimeSeries(ctx context.Context, metricNamer 
 	return qm.query(ctx, query.GenericQuery.Metric, startTime, endTime, qm.step)
 }
 
-func (qm *qcloudmonitor) QueryTimeSeries(ctx context.Context, metricNamer metricnaming.MetricNamer, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
+func (qm *barad) QueryTimeSeries(ctx context.Context, metricNamer metricnaming.MetricNamer, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
 	builder := metricNamer.QueryBuilder().Builder(metricquery.QCloudMonitorMetricSource)
 	if builder == nil {
 		return nil, fmt.Errorf("nil builder for %v", metricNamer.BuildUniqueKey())
@@ -98,7 +69,7 @@ func (qm *qcloudmonitor) QueryTimeSeries(ctx context.Context, metricNamer metric
 	return qm.query(ctx, query.GenericQuery.Metric, startTime, endTime, step)
 }
 
-func (qm *qcloudmonitor) query(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
+func (qm *barad) query(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
 	if metric == nil {
 		return nil, fmt.Errorf("metric is null")
 	}
@@ -118,7 +89,7 @@ func (qm *qcloudmonitor) query(ctx context.Context, metric *metricquery.Metric, 
 	}
 }
 
-func (qm *qcloudmonitor) workloadMetric(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
+func (qm *barad) workloadMetric(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
 	selector := metric.Workload.Selector
 	if selector == nil {
 		return nil, fmt.Errorf("selector is null, require label %v", consts.LabelClusterId)
@@ -137,7 +108,7 @@ func (qm *qcloudmonitor) workloadMetric(ctx context.Context, metric *metricquery
 	case v1.ResourceCPU.String():
 		return qm.getMonitorData(ctx, qmonitor.K8sWorkloadCpuCoreUsedMetric, conds, startTime, endTime, step)
 	case v1.ResourceMemory.String():
-		return qm.getMonitorData(ctx, qmonitor.K8sWorkloadMemNoCacheBytesMetric, conds, startTime, endTime, step)
+		return qm.getMonitorData(ctx, qmonitor.K8sWorkloadMemUsageBytesMetric, conds, startTime, endTime, step)
 	case consts.MetricCpuRequest:
 		return qm.getMonitorData(ctx, qmonitor.K8sWorkloadCpuRequestsMetric, conds, startTime, endTime, step)
 	case consts.MetricCpuLimit:
@@ -153,7 +124,7 @@ func (qm *qcloudmonitor) workloadMetric(ctx context.Context, metric *metricquery
 	}
 }
 
-func (qm *qcloudmonitor) containerMetric(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
+func (qm *barad) containerMetric(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
 	selector := metric.Container.Selector
 	if selector == nil {
 		return nil, fmt.Errorf("selector is null, require label %v", consts.LabelClusterId)
@@ -172,7 +143,7 @@ func (qm *qcloudmonitor) containerMetric(ctx context.Context, metric *metricquer
 	case v1.ResourceCPU.String():
 		return qm.getMonitorData(ctx, qmonitor.K8sContainerCpuCoreUsedMetric, conds, startTime, endTime, step)
 	case v1.ResourceMemory.String():
-		return qm.getMonitorData(ctx, qmonitor.K8sContainerMemNoCacheBytesMetric, conds, startTime, endTime, step)
+		return qm.getMonitorData(ctx, qmonitor.K8sContainerMemUsageBytesMetric, conds, startTime, endTime, step)
 	case consts.MetricCpuRequest:
 		return qm.getMonitorData(ctx, qmonitor.K8sContainerCpuCoreRequestMetric, conds, startTime, endTime, step)
 	case consts.MetricCpuLimit:
@@ -186,7 +157,7 @@ func (qm *qcloudmonitor) containerMetric(ctx context.Context, metric *metricquer
 	}
 }
 
-func (qm *qcloudmonitor) podMetric(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
+func (qm *barad) podMetric(ctx context.Context, metric *metricquery.Metric, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
 	selector := metric.Pod.Selector
 	if selector == nil {
 		return nil, fmt.Errorf("selector is null, require label %v", consts.LabelClusterId)
@@ -205,7 +176,7 @@ func (qm *qcloudmonitor) podMetric(ctx context.Context, metric *metricquery.Metr
 	case v1.ResourceCPU.String():
 		return qm.getMonitorData(ctx, qmonitor.K8sPodCpuCoreUsedMetric, conds, startTime, endTime, step)
 	case v1.ResourceMemory.String():
-		return qm.getMonitorData(ctx, qmonitor.K8sPodMemNoCacheBytesMetric, conds, startTime, endTime, step)
+		return qm.getMonitorData(ctx, qmonitor.K8sPodMemUsageBytesMetric, conds, startTime, endTime, step)
 	default:
 		return nil, fmt.Errorf("not supported metric name %v for qcloud monitor", metric.MetricName)
 	}
@@ -309,7 +280,7 @@ func MakeContainerMetricConditions(clusterid, namespace, workloadname, container
 	return conditions
 }
 
-func (qm *qcloudmonitor) getMonitorData(ctx context.Context, metricName string, conditions []common.QueryCondition, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
+func (qm *barad) getMonitorData(ctx context.Context, metricName string, conditions []common.QueryCondition, startTime time.Time, endTime time.Time, step time.Duration) ([]*common.TimeSeries, error) {
 	startStr := startTime.Format(time.RFC3339)
 	endStr := endTime.Format(time.RFC3339)
 	period := uint64(step.Seconds())
@@ -356,14 +327,13 @@ func ConvertLabels(dimensions []qmonitor.Dimension) []common.Label {
 func Points2Samples(metric string, points []qmonitor.Point) []common.Sample {
 	results := make([]common.Sample, 0)
 	memoryMetricsSet := sets.NewString(qmonitor.K8sPodMemNoCacheBytesMetric, qmonitor.K8sPodMemUsageBytesMetric,
-		qmonitor.K8sContainerMemNoCacheBytesMetric, qmonitor.K8sContainerMemUsageBytesMetric,
-		qmonitor.K8sWorkloadMemUsageBytesMetric, qmonitor.K8sWorkloadMemNoCacheBytesMetric)
+		qmonitor.K8sContainerMemNoCacheBytesMetric, qmonitor.K8sContainerMemUsageBytesMetric, qmonitor.K8sWorkloadCpuCoreUsedMetric)
 	for _, point := range points {
 		if point.Timestamp != nil && point.Value != nil {
 			// NOTE: barad ram unit is MByte, convert it to Bytes
 			val := *point.Value
 			if memoryMetricsSet.Has(metric) {
-				val = val * 1024. * 1024.
+				val = val * 1024.
 			}
 			results = append(results, common.Sample{Timestamp: int64(*point.Timestamp), Value: val})
 		}

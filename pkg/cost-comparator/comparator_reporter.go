@@ -11,6 +11,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	resourcehelper "k8s.io/kubernetes/pkg/api/v1/resource"
 
+	"github.com/gocrane/fadvisor/pkg/cache"
 	"github.com/gocrane/fadvisor/pkg/consts"
 	"github.com/gocrane/fadvisor/pkg/cost-comparator/config"
 	"github.com/gocrane/fadvisor/pkg/cost-comparator/coster"
@@ -21,7 +22,13 @@ func (c *Comparator) ReportOriginalWorkloadsResourceDistribution(costerCtx *cost
 	data := [][]string{}
 	for kind, kindWorkloads := range costerCtx.WorkloadsSpec {
 		for nn, workload := range kindWorkloads {
-
+			var totalPrice float64 = -1
+			kindWorkloadsPrices, ok := costerCtx.WorkloadsPrices[kind]
+			if ok {
+				if price, ok := kindWorkloadsPrices[nn]; ok {
+					totalPrice = price.TotalPrice
+				}
+			}
 			cpuReqFloat64Cores := float64(workload.Cpu.MilliValue()) / 1000.
 			memReqFloat64GB := float64(workload.Mem.Value()) / consts.GB
 			cpuLimFloat64Cores := float64(workload.CpuLimit.MilliValue()) / 1000.
@@ -48,7 +55,7 @@ func (c *Comparator) ReportOriginalWorkloadsResourceDistribution(costerCtx *cost
 			}
 
 			data = append(data,
-				[]string{kind, nn.Namespace, nn.Name, Float642Str(cpuReqFloat64Cores), Float642Str(memReqFloat64GB), Float642Str(cpuLimFloat64Cores), Float642Str(memLimFloat64GB), fmt.Sprintf("%v", workload.GoodsNum), fmt.Sprintf("%v", workload.Serverless), string(workload.QoSClass), labelsStr},
+				[]string{kind, nn.Namespace, nn.Name, Float642Str(cpuReqFloat64Cores), Float642Str(memReqFloat64GB), Float642Str(cpuLimFloat64Cores), Float642Str(memLimFloat64GB), fmt.Sprintf("%v", workload.GoodsNum), fmt.Sprintf("%v", workload.Serverless), Float642Str(totalPrice), string(workload.QoSClass), labelsStr},
 			)
 		}
 	}
@@ -58,9 +65,10 @@ func (c *Comparator) ReportOriginalWorkloadsResourceDistribution(costerCtx *cost
 		table := tablewriter.NewWriter(os.Stdout)
 		table.SetHeaderLine(true)
 		table.SetAutoFormatHeaders(false)
-		table.SetHeader([]string{"Kind", "Namespace", "Name", "CpuReq", "MemReq", "CpuLim", "MemLim", "Replicas", "Serverless", "K8SQoS", "Labels"})
+		table.SetHeader([]string{"Kind", "Namespace", "Name", "CpuReq", "MemReq", "CpuLim", "MemLim", "Replicas", "Serverless", "Price", "K8SQoS", "Labels"})
 		table.SetBorder(false) // Set Border to false
 		table.SetHeaderColor(
+			tablewriter.Colors{tablewriter.FgHiRedColor, tablewriter.Bold, tablewriter.BgBlackColor},
 			tablewriter.Colors{tablewriter.FgHiRedColor, tablewriter.Bold, tablewriter.BgBlackColor},
 			tablewriter.Colors{tablewriter.FgHiRedColor, tablewriter.Bold, tablewriter.BgBlackColor},
 			tablewriter.Colors{tablewriter.FgHiRedColor, tablewriter.Bold, tablewriter.BgBlackColor},
@@ -75,6 +83,7 @@ func (c *Comparator) ReportOriginalWorkloadsResourceDistribution(costerCtx *cost
 		)
 
 		table.SetColumnColor(
+			tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor},
 			tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor},
 			tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor},
 			tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor},
@@ -100,7 +109,7 @@ func (c *Comparator) ReportOriginalWorkloadsResourceDistribution(costerCtx *cost
 		}
 		csvW := csv.NewWriter(csvFile)
 		csvW.Comma = '\t'
-		err = csvW.Write([]string{"Kind", "Namespace", "Name", "CpuReq", "MemReq", "CpuLim", "MemLim", "Replicas", "Serverless", "K8SQoS", "Labels"})
+		err = csvW.Write([]string{"Kind", "Namespace", "Name", "CpuReq", "MemReq", "CpuLim", "MemLim", "Replicas", "Serverless", "Price", "K8SQoS", "Labels"})
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(255)
@@ -118,24 +127,241 @@ func (c *Comparator) ReportRecommendedWorkloadsResourceDistribution(costerCtx *c
 	data := [][]string{}
 	for kind, kindWorkloads := range costerCtx.WorkloadsRecSpec {
 		for nn, workload := range kindWorkloads {
-			cpuReqFloat64Cores := float64(workload.RecommendedSpec.Cpu.MilliValue()) / 1000.
-			memReqFloat64GB := float64(workload.RecommendedSpec.Mem.Value()) / consts.GB
-			cpuLimFloat64Cores := float64(workload.RecommendedSpec.CpuLimit.MilliValue()) / 1000.
-			memLimFloat64GB := float64(workload.RecommendedSpec.MemLimit.Value()) / consts.GB
+			var directTotalPrice float64 = -1
+			var recTotalPrice float64 = -1
+			var percentRecTotalPrice float64 = -1
+			var maxRecTotalPrice float64 = -1
+			var maxMarginRecTotalPrice float64 = -1
+			var requestSameLimitRecPrice float64 = -1
+
+			kindWorkloadsRecPrices, ok := costerCtx.WorkloadsRecPrices[kind]
+			if ok {
+				if price, ok := kindWorkloadsRecPrices[nn]; ok {
+					directTotalPrice = price.DirectSpec.TotalPrice
+					recTotalPrice = price.RecommendedSpec.TotalPrice
+					percentRecTotalPrice = price.PercentRecommendedSpec.TotalPrice
+					maxRecTotalPrice = price.MaxRecommendedSpec.TotalPrice
+					maxMarginRecTotalPrice = price.MaxMarginRecommendedSpec.TotalPrice
+					requestSameLimitRecPrice = price.RequestSameLimitRecommendedSpec.TotalPrice
+				}
+			}
+
+			directCpuReqFloat64Cores := float64(workload.DirectSpec.Cpu.MilliValue()) / 1000.
+			directMemReqFloat64GB := float64(workload.DirectSpec.Mem.Value()) / consts.GB
+			directCpuLimFloat64Cores := float64(workload.DirectSpec.CpuLimit.MilliValue()) / 1000.
+			directMemLimFloat64GB := float64(workload.DirectSpec.MemLimit.Value()) / consts.GB
+
+			recCpuReqFloat64Cores := float64(workload.RecommendedSpec.Cpu.MilliValue()) / 1000.
+			recMemReqFloat64GB := float64(workload.RecommendedSpec.Mem.Value()) / consts.GB
+			recCpuLimFloat64Cores := float64(workload.RecommendedSpec.CpuLimit.MilliValue()) / 1000.
+			recMemLimFloat64GB := float64(workload.RecommendedSpec.MemLimit.Value()) / consts.GB
+
+			percentRecCpuReqFloat64Cores := float64(workload.PercentRecommendedSpec.Cpu.MilliValue()) / 1000.
+			percentRecMemReqFloat64GB := float64(workload.PercentRecommendedSpec.Mem.Value()) / consts.GB
+			percentRecCpuLimFloat64Cores := float64(workload.PercentRecommendedSpec.CpuLimit.MilliValue()) / 1000.
+			percentRecMemLimFloat64GB := float64(workload.PercentRecommendedSpec.MemLimit.Value()) / consts.GB
+
+			maxRecCpuReqFloat64Cores := float64(workload.MaxRecommendedSpec.Cpu.MilliValue()) / 1000.
+			maxRecMemReqFloat64GB := float64(workload.MaxRecommendedSpec.Mem.Value()) / consts.GB
+			maxRecCpuLimFloat64Cores := float64(workload.MaxRecommendedSpec.CpuLimit.MilliValue()) / 1000.
+			maxRecMemLimFloat64GB := float64(workload.MaxRecommendedSpec.MemLimit.Value()) / consts.GB
+
+			maxMarginRecCpuReqFloat64Cores := float64(workload.MaxMarginRecommendedSpec.Cpu.MilliValue()) / 1000.
+			maxMarginRecMemReqFloat64GB := float64(workload.MaxMarginRecommendedSpec.Mem.Value()) / consts.GB
+			maxMarginReCpuLimFloat64Cores := float64(workload.MaxMarginRecommendedSpec.CpuLimit.MilliValue()) / 1000.
+			maxMarginRecMemLimFloat64GB := float64(workload.MaxMarginRecommendedSpec.MemLimit.Value()) / consts.GB
+
+			requestSameLimitRecCpuReqFloat64Cores := float64(workload.RequestSameLimitRecommendedSpec.Cpu.MilliValue()) / 1000.
+			requestSameLimitRecMemReqFloat64GB := float64(workload.RequestSameLimitRecommendedSpec.Mem.Value()) / consts.GB
+			requestSameLimitRecCpuLimFloat64Cores := float64(workload.RequestSameLimitRecommendedSpec.CpuLimit.MilliValue()) / 1000.
+			requestSameLimitRecMemLimFloat64GB := float64(workload.RequestSameLimitRecommendedSpec.MemLimit.Value()) / consts.GB
+
 			containerStats, _ := json.Marshal(workload.Containers)
+			recContainerStats, _ := json.Marshal(workload.RecContainers)
+			recMaxContainerStats, _ := json.Marshal(workload.RecMaxContainers)
+			recMaxMarginContainerStats, _ := json.Marshal(workload.RecMaxMarginContainers)
+			recPercentileContainerStats, _ := json.Marshal(workload.RecPercentileContainers)
+			recReqSameLimitContainerStats, _ := json.Marshal(workload.RecReqSameLimitContainers)
+
 			data = append(data,
-				[]string{kind, nn.Namespace, nn.Name, Float642Str(cpuReqFloat64Cores), Float642Str(memReqFloat64GB), Float642Str(cpuLimFloat64Cores), Float642Str(memLimFloat64GB), fmt.Sprintf("%v", workload.RecommendedSpec.GoodsNum), fmt.Sprintf("%v", workload.RecommendedSpec.Serverless), string(workload.RecommendedSpec.QoSClass), string(containerStats)},
+				[]string{kind,
+					nn.Namespace,
+					nn.Name,
+					Float642Str(directCpuReqFloat64Cores),
+					Float642Str(directMemReqFloat64GB),
+					Float642Str(directCpuLimFloat64Cores),
+					Float642Str(directMemLimFloat64GB),
+					Float642Str(recCpuReqFloat64Cores),
+					Float642Str(recMemReqFloat64GB),
+					Float642Str(recCpuLimFloat64Cores),
+					Float642Str(recMemLimFloat64GB),
+
+					Float642Str(percentRecCpuReqFloat64Cores),
+					Float642Str(percentRecMemReqFloat64GB),
+					Float642Str(percentRecCpuLimFloat64Cores),
+					Float642Str(percentRecMemLimFloat64GB),
+
+					Float642Str(maxRecCpuReqFloat64Cores),
+					Float642Str(maxRecMemReqFloat64GB),
+					Float642Str(maxRecCpuLimFloat64Cores),
+					Float642Str(maxRecMemLimFloat64GB),
+
+					Float642Str(maxMarginRecCpuReqFloat64Cores),
+					Float642Str(maxMarginRecMemReqFloat64GB),
+					Float642Str(maxMarginReCpuLimFloat64Cores),
+					Float642Str(maxMarginRecMemLimFloat64GB),
+
+					Float642Str(requestSameLimitRecCpuReqFloat64Cores),
+					Float642Str(requestSameLimitRecMemReqFloat64GB),
+					Float642Str(requestSameLimitRecCpuLimFloat64Cores),
+					Float642Str(requestSameLimitRecMemLimFloat64GB),
+
+					fmt.Sprintf("%v", workload.RecommendedSpec.GoodsNum),
+					fmt.Sprintf("%v", workload.RecommendedSpec.Serverless),
+					Float642Str(directTotalPrice),
+					Float642Str(recTotalPrice),
+					Float642Str(percentRecTotalPrice),
+					Float642Str(maxRecTotalPrice),
+					Float642Str(maxMarginRecTotalPrice),
+					Float642Str(requestSameLimitRecPrice),
+					string(workload.RecommendedSpec.QoSClass),
+					string(containerStats),
+					string(recContainerStats),
+					string(recMaxContainerStats),
+					string(recMaxMarginContainerStats),
+					string(recPercentileContainerStats),
+					string(recReqSameLimitContainerStats),
+				},
 			)
 		}
 	}
 
 	fmt.Println("Reporting, Recommended Workloads Resource Distribution.....................................................................................................")
-
+	headers := []string{"Kind",
+		"Namespace",
+		"Name",
+		"DirectCpuReq",
+		"DirectMemReq",
+		"DirectCpuLim",
+		"DirectMemLim",
+		"RecCpuReq",
+		"RecMemReq",
+		"RecCpuLim",
+		"RecMemLim",
+		"PercentRecCpuReq",
+		"PercentRecMemReq",
+		"PercentRecCpuLim",
+		"PercentRecMemLim",
+		"MaxRecCpuReq",
+		"MaxRecMemReq",
+		"MaxRecCpuLim",
+		"MaxRecMemLim",
+		"MaxMarginRecCpuReq",
+		"MaxMarginRecMemReq",
+		"MaxMarginReCpuLim",
+		"MaxMarginRecMemLim",
+		"RequestSameLimitRecCpu",
+		"RequestSameLimitRecMem",
+		"RequestSameLimitRecCpuLim",
+		"RequestSameLimitRecMemLim",
+		"Replicas",
+		"Serverless",
+		"DirectPrice",
+		"RecTotalPrice",
+		"PercentRecTotalPrice",
+		"MaxRecTotalPrice",
+		"MaxMarginRecTotalPrice",
+		"RequestSameLimitRecPrice",
+		"K8SQoS",
+		"ContainerStats",
+		"RecContainerStats",
+		"RecMaxContainerStats",
+		"RecMaxMarginContainerStats",
+		"RecPercentileContainerStats",
+		"RecReqSameLimitContainerStats",
+	}
 	if c.config.OutputMode == "" || c.config.OutputMode == config.OutputModeStdOut {
 		table := tablewriter.NewWriter(os.Stdout)
 		table.SetHeaderLine(true)
 		table.SetAutoFormatHeaders(false)
-		table.SetHeader([]string{"Kind", "Namespace", "Name", "CpuReq", "MemReq", "CpuLim", "MemLim", "Replicas", "Serverless", "K8SQoS", "ContainerStats"})
+		table.SetHeader(headers)
+		table.SetBorder(false) // Set Border to false
+		table.SetHeaderColor(GenHeaderColor(len(headers))...)
+		table.SetColumnColor(GenColumnColor(len(headers))...)
+		table.AppendBulk(data) // Add Bulk Data
+		table.Render()
+	}
+
+	filename := filepath.Join(c.config.DataPath, c.config.ClusterId+"-recommended-workloads-distribution"+".csv")
+	if c.config.OutputMode == "" || c.config.OutputMode == config.OutputModeCsv {
+		csvFile, err := os.Create(filename)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(255)
+		}
+		csvW := csv.NewWriter(csvFile)
+		csvW.Comma = '\t'
+		err = csvW.Write(headers)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(255)
+		}
+		err = csvW.WriteAll(data)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(255)
+		}
+	}
+
+	fmt.Println()
+}
+
+func GenHeaderColor(n int) []tablewriter.Colors {
+	var result []tablewriter.Colors
+	for i := 0; i < n; i++ {
+		result = append(result, tablewriter.Colors{tablewriter.FgHiRedColor, tablewriter.Bold, tablewriter.BgBlackColor})
+	}
+	return result
+}
+
+func GenColumnColor(n int) []tablewriter.Colors {
+	var result []tablewriter.Colors
+	for i := 0; i < n; i++ {
+		result = append(result, tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor})
+	}
+	return result
+}
+
+func (c *Comparator) ReportNodesDistribution(costerCtx *coster.CosterContext) {
+	data := [][]string{}
+	for nodeName, node := range costerCtx.NodesSpec {
+		var totalPrice float64 = -1
+		kindWorkloadsPrices, ok := costerCtx.NodesPrices[nodeName]
+		if ok {
+			totalPrice = kindWorkloadsPrices.TotalPrice
+		}
+		cpuFloat64Cores := float64(node.Cpu.MilliValue()) / 1000.
+		memFloat64GB := float64(node.Mem.Value()) / consts.GB
+		gpuFloat64GB := float64(node.Gpu.Value())
+
+		nodeType := "real"
+		// non serverless, use original pod template resource requirements
+		if node.VirtualNode {
+			totalPrice = 0
+			nodeType = "vk"
+		}
+
+		data = append(data,
+			[]string{nodeName, Float642Str(cpuFloat64Cores), Float642Str(memFloat64GB), Float642Str(totalPrice), nodeType, node.GpuType, Float642Str(gpuFloat64GB), node.Zone, node.Region, node.InstanceType, node.ChargeType},
+		)
+	}
+
+	fmt.Println("Reporting, Nodes Resource Distribution.....................................................................................................")
+	if c.config.OutputMode == "" || c.config.OutputMode == config.OutputModeStdOut {
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetHeaderLine(true)
+		table.SetAutoFormatHeaders(false)
+		table.SetHeader([]string{"Name", "Cpu", "Mem", "Price", "Type", "GpuType", "Gpu", "Zone", "Region", "InstanceType", "ChargeType"})
 		table.SetBorder(false) // Set Border to false
 		table.SetHeaderColor(
 			tablewriter.Colors{tablewriter.FgHiRedColor, tablewriter.Bold, tablewriter.BgBlackColor},
@@ -164,12 +390,11 @@ func (c *Comparator) ReportRecommendedWorkloadsResourceDistribution(costerCtx *c
 			tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor},
 			tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor},
 		)
-
 		table.AppendBulk(data) // Add Bulk Data
 		table.Render()
 	}
 
-	filename := filepath.Join(c.config.DataPath, c.config.ClusterId+"-recommended-workloads-distribution"+".csv")
+	filename := filepath.Join(c.config.DataPath, c.config.ClusterId+"-nodes-distribution"+".csv")
 	if c.config.OutputMode == "" || c.config.OutputMode == config.OutputModeCsv {
 		csvFile, err := os.Create(filename)
 		if err != nil {
@@ -178,7 +403,7 @@ func (c *Comparator) ReportRecommendedWorkloadsResourceDistribution(costerCtx *c
 		}
 		csvW := csv.NewWriter(csvFile)
 		csvW.Comma = '\t'
-		err = csvW.Write([]string{"Kind", "Namespace", "Name", "CpuReq", "MemReq", "CpuLim", "MemLim", "Replicas", "Serverless", "K8SQoS", "ContainerStats"})
+		err = csvW.Write([]string{"Name", "Cpu", "Mem", "Price", "Type", "GpuType", "Gpu", "Zone", "Region", "InstanceType", "ChargeType"})
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(255)
@@ -189,13 +414,14 @@ func (c *Comparator) ReportRecommendedWorkloadsResourceDistribution(costerCtx *c
 			os.Exit(255)
 		}
 	}
-
 	fmt.Println()
 }
 
 func (c *Comparator) ReportOriginalResourceSummary() {
 
 	pods := c.clusterCache.GetPods()
+	pods = cache.FilterPendingFailedPods(pods)
+
 	clusterRequestsTotal, clusterLimitsTotal := util.PodsRequestsAndLimitsTotal(pods, func(pod *v1.Pod) bool {
 		return false
 	}, false)
@@ -447,9 +673,10 @@ func (c *Comparator) ReportRecommendedResourceSummary(costerCtx *coster.CosterCo
 
 func (c *Comparator) ReportRecommendedCostSummary(costerCtx *coster.CosterContext) {
 	recommendedCoster := coster.NewRecommenderCoster()
-	RecommendedCost, PercentileCost, MaxCost, MaxMarginCost := recommendedCoster.TotalCost(costerCtx)
+	DirectCost, RecommendedCost, PercentileCost, MaxCost, MaxMarginCost := recommendedCoster.TotalCost(costerCtx)
 
 	data := [][]string{
+		{"eks-direct-without-recommendation", Float642Str(DirectCost.TotalCost), Float642Str(DirectCost.WorkloadCost), Float642Str(DirectCost.PlatformCost)},
 		{"eks-recommended-by-percentile-margin", Float642Str(RecommendedCost.TotalCost), Float642Str(RecommendedCost.WorkloadCost), Float642Str(RecommendedCost.PlatformCost)},
 		{"eks-recommended-by-percentile", Float642Str(PercentileCost.TotalCost), Float642Str(PercentileCost.WorkloadCost), Float642Str(PercentileCost.PlatformCost)},
 		{"eks-recommended-by-max-margin", Float642Str(MaxMarginCost.TotalCost), Float642Str(MaxMarginCost.WorkloadCost), Float642Str(MaxMarginCost.PlatformCost)},

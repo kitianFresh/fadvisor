@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"github.com/gocrane/fadvisor/pkg/consts"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -26,7 +28,6 @@ import (
 	"github.com/gocrane/crane/pkg/common"
 	"github.com/gocrane/fadvisor/pkg/cache"
 	"github.com/gocrane/fadvisor/pkg/cloud"
-	"github.com/gocrane/fadvisor/pkg/consts"
 	"github.com/gocrane/fadvisor/pkg/cost-comparator/config"
 	"github.com/gocrane/fadvisor/pkg/cost-comparator/coster"
 	"github.com/gocrane/fadvisor/pkg/cost-comparator/estimator"
@@ -122,6 +123,7 @@ func (c *Comparator) DoAnalysis() {
 
 	c.ReportOriginalWorkloadsResourceDistribution(costerCtx)
 	c.ReportRecommendedWorkloadsResourceDistribution(costerCtx)
+	c.ReportNodesDistribution(costerCtx)
 
 }
 
@@ -150,6 +152,7 @@ func (c *Comparator) getQueryRange() promapiv1.Range {
 func (c *Comparator) GetAllPodsSpec() map[string] /*namespace-name*/ spec.CloudPodSpec {
 	res := make(map[string]spec.CloudPodSpec)
 	pods := c.clusterCache.GetPods()
+	pods = cache.FilterPendingFailedPods(pods)
 	for _, pod := range pods {
 		res[klog.KObj(pod).String()] = c.baselineCloud.Pod2Spec(pod)
 	}
@@ -169,52 +172,88 @@ func (c *Comparator) GetAllNodesSpec() map[string] /*nodename*/ spec.CloudNodeSp
 // build workloads by inverted-index pods
 func (c *Comparator) initWorkloadsSpec() map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ spec.CloudPodSpec {
 	workloads := make(map[string]map[types.NamespacedName]spec.CloudPodSpec)
+	var lock sync.Mutex
+	var wg sync.WaitGroup
 	pods := c.clusterCache.GetPods()
-	for _, pod := range pods {
-		unstruct, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pod)
-		if err != nil {
-			klog.V(4).Info(err)
-			continue
-		}
-		rootUnstruct, err := ownerutil.FindRootOwner(context.TODO(), c.restMapper, c.kubeDynamicClient, &unstructured.Unstructured{Object: unstruct})
-		if err != nil {
-			klog.V(4).Info(err)
-			continue
-		}
-		kind := rootUnstruct.GetKind()
+	podsChan := make(chan *v1.Pod, 10240)
+	checkExists := func(kind string, nn types.NamespacedName) bool {
+		lock.Lock()
+		defer lock.Unlock()
 		nnworklod, ok := workloads[kind]
 		if !ok {
 			nnworklod = make(map[types.NamespacedName]spec.CloudPodSpec)
 			workloads[kind] = nnworklod
 		}
-		nn := types.NamespacedName{Namespace: rootUnstruct.GetNamespace(), Name: rootUnstruct.GetName()}
-
 		// ignore if already fetched
-		if _, exists := nnworklod[nn]; exists {
-			continue
-		}
-		podSpec := c.baselineCloud.Pod2Spec(pod)
-		if strings.ToLower(kind) != "pod" {
-			// because of job & cronjob is very special workload, it is once task, we can not estimate is directly
-			if strings.ToLower(kind) == "cronjob" || strings.ToLower(kind) == "job" {
-				klog.Warningf("Ignore %v %v: %v", rootUnstruct.GetAPIVersion(), kind, nn)
-				continue
-			}
-			desiredReplicas, _, err := c.targetInfoFetcher.FetchReplicas(&v1.ObjectReference{
-				Name:       rootUnstruct.GetName(),
-				Kind:       rootUnstruct.GetKind(),
-				Namespace:  rootUnstruct.GetNamespace(),
-				APIVersion: rootUnstruct.GetAPIVersion(),
-			})
-			if err != nil {
-				klog.Errorf("Failed to fetch target info for kind %v, nn: %v, err: %v", kind, nn, err)
-				continue
-			}
-			podSpec.GoodsNum = uint64(desiredReplicas)
-		}
-		podSpec.Workload = rootUnstruct
-		nnworklod[nn] = podSpec
+		_, exists := nnworklod[nn]
+		return exists
 	}
+
+	setCloudPod := func(kind string, nn types.NamespacedName, podSpec spec.CloudPodSpec) {
+		lock.Lock()
+		defer lock.Unlock()
+		workloads[kind][nn] = podSpec
+	}
+
+	worker := func(i int) {
+		defer wg.Done()
+		for pod := range podsChan {
+			unstruct, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pod)
+			if err != nil {
+				klog.V(4).Info(err)
+				continue
+			}
+			rootUnstruct, err := ownerutil.FindRootOwner(context.TODO(), c.restMapper, c.kubeDynamicClient, &unstructured.Unstructured{Object: unstruct})
+			if err != nil {
+				klog.V(4).Info(err)
+				continue
+			}
+			kind := rootUnstruct.GetKind()
+			nn := types.NamespacedName{Namespace: rootUnstruct.GetNamespace(), Name: rootUnstruct.GetName()}
+
+			// ignore if already fetched
+			if exists := checkExists(kind, nn); exists {
+				continue
+			}
+			podSpec := c.baselineCloud.Pod2Spec(pod)
+			if strings.ToLower(kind) != "pod" {
+				// because of job & cronjob is very special workload, it is once task, we can not estimate is directly
+				if strings.ToLower(kind) == "cronjob" || strings.ToLower(kind) == "job" {
+					klog.Warningf("Ignore %v %v: %v for pod: %v", rootUnstruct.GetAPIVersion(), kind, nn, klog.KObj(pod))
+					continue
+				}
+				desiredReplicas, _, err := c.targetInfoFetcher.FetchReplicas(&v1.ObjectReference{
+					Name:       rootUnstruct.GetName(),
+					Kind:       rootUnstruct.GetKind(),
+					Namespace:  rootUnstruct.GetNamespace(),
+					APIVersion: rootUnstruct.GetAPIVersion(),
+				})
+				if err != nil {
+					klog.Errorf("Failed to fetch target info for apiversion: %v, kind: %v, nn: %v, pod: %v, err: %v", rootUnstruct.GetAPIVersion(), kind, nn, klog.KObj(pod), err)
+					continue
+				}
+				podSpec.GoodsNum = uint64(desiredReplicas)
+			}
+			podSpec.Workload = rootUnstruct
+			setCloudPod(kind, nn, podSpec)
+		}
+		klog.Infof("initWorkloadsSpec worker %v exit", i)
+	}
+
+	for i := 0; i < c.config.Workers; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+	for _, pod := range pods {
+		podsChan <- pod
+	}
+
+	close(podsChan)
+
+	wg.Wait()
+
+	klog.Infof("initWorkloadsSpec all worker finished")
+
 	c.workloadsSpecCache = workloads
 	return workloads
 }
@@ -1194,77 +1233,110 @@ func (c *Comparator) fetchWorkloadMetricData() map[string]map[types.NamespacedNa
 	results := make(map[string]map[types.NamespacedName]*RawWorkloadTimeSeriesData)
 	workloads := c.workloadsSpecCache
 	qRange := c.getQueryRange()
-	for kind := range workloads {
-		if kindWorkloads, ok := workloads[kind]; ok {
-			kindResult, ok := results[kind]
-			if !ok {
-				kindResult = make(map[types.NamespacedName]*RawWorkloadTimeSeriesData)
-				results[kind] = kindResult
-			}
-			for nn, workload := range kindWorkloads {
-				target := &v1.ObjectReference{
-					Kind:       workload.Workload.GetKind(),
-					Namespace:  workload.Workload.GetNamespace(),
-					Name:       workload.Workload.GetName(),
-					APIVersion: workload.Workload.GetAPIVersion(),
-				}
-
-				workloadCpuUsage := metricnaming.ResourceToWorkloadMetricNamer(c.config.ClusterId, target, v1.ResourceCPU, labels.Everything())
-				workloadMemUsage := metricnaming.ResourceToWorkloadMetricNamer(c.config.ClusterId, target, v1.ResourceMemory, labels.Everything())
-				workloadCpuReqs := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricCpuRequest, labels.Everything())
-				workloadCpuLims := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricCpuLimit, labels.Everything())
-				workloadMemReqs := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricMemRequest, labels.Everything())
-				workloadMemLims := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricMemLimit, labels.Everything())
-				workloadReplicas := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricWorkloadReplicas, labels.Everything())
-
-				wkCpuUsageTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadCpuUsage, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadCpuUsage.BuildUniqueKey(), err)
-					continue
-				}
-				wkMemUsageTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadMemUsage, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadMemUsage.BuildUniqueKey(), err)
-					continue
-				}
-				wkCpuReqTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadCpuReqs, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadCpuReqs.BuildUniqueKey(), err)
-					continue
-				}
-				wkCpuLimTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadCpuLims, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadCpuLims.BuildUniqueKey(), err)
-					continue
-				}
-				wkMemReqTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadMemReqs, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadMemReqs.BuildUniqueKey(), err)
-					continue
-				}
-				wkMemLimTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadMemLims, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadMemLims.BuildUniqueKey(), err)
-					continue
-				}
-				wkReplicasTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadReplicas, qRange.Start, qRange.End, qRange.Step)
-				if err != nil {
-					klog.Errorf("Failed to query history for metric %v: %v", workloadReplicas.BuildUniqueKey(), err)
-					continue
-				}
-
-				kindResult[nn] = &RawWorkloadTimeSeriesData{
-					Cpu:         wkCpuUsageTs,
-					Mem:         wkMemUsageTs,
-					CpuRequests: wkCpuReqTs,
-					MemRequests: wkMemReqTs,
-					CpuLimits:   wkCpuLimTs,
-					MemLimits:   wkMemLimTs,
-					Replicas:    wkReplicasTs,
-				}
-			}
+	var lock sync.Mutex
+	var wg sync.WaitGroup
+	checker := func(kind string) {
+		lock.Lock()
+		defer lock.Unlock()
+		kindResult, ok := results[kind]
+		if !ok {
+			kindResult = make(map[types.NamespacedName]*RawWorkloadTimeSeriesData)
+			results[kind] = kindResult
 		}
 	}
+
+	setter := func(kind string, nn types.NamespacedName, data *RawWorkloadTimeSeriesData) {
+		lock.Lock()
+		defer lock.Unlock()
+		results[kind][nn] = data
+	}
+
+	targetsChan := make(chan *v1.ObjectReference, 10240)
+
+	worker := func(i int) {
+		defer wg.Done()
+		for target := range targetsChan {
+			kind := target.Kind
+			nn := types.NamespacedName{Namespace: target.Namespace, Name: target.Name}
+			checker(kind)
+			workloadCpuUsage := metricnaming.ResourceToWorkloadMetricNamer(c.config.ClusterId, target, v1.ResourceCPU, labels.Everything())
+			workloadMemUsage := metricnaming.ResourceToWorkloadMetricNamer(c.config.ClusterId, target, v1.ResourceMemory, labels.Everything())
+			//workloadCpuReqs := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricCpuRequest, labels.Everything())
+			//workloadCpuLims := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricCpuLimit, labels.Everything())
+			//workloadMemReqs := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricMemRequest, labels.Everything())
+			//workloadMemLims := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricMemLimit, labels.Everything())
+			//workloadReplicas := metricnaming.WorkloadMetricNamer(c.config.ClusterId, target, consts.MetricWorkloadReplicas, labels.Everything())
+
+			wkCpuUsageTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadCpuUsage, qRange.Start, qRange.End, qRange.Step)
+			if err != nil {
+				klog.Errorf("Failed to query history for metric %v: %v", workloadCpuUsage.BuildUniqueKey(), err)
+				continue
+			}
+			wkMemUsageTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadMemUsage, qRange.Start, qRange.End, qRange.Step)
+			if err != nil {
+				klog.Errorf("Failed to query history for metric %v: %v", workloadMemUsage.BuildUniqueKey(), err)
+				continue
+			}
+			//wkCpuReqTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadCpuReqs, qRange.Start, qRange.End, qRange.Step)
+			//if err != nil {
+			//	klog.Errorf("Failed to query history for metric %v: %v", workloadCpuReqs.BuildUniqueKey(), err)
+			//	continue
+			//}
+			//wkCpuLimTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadCpuLims, qRange.Start, qRange.End, qRange.Step)
+			//if err != nil {
+			//	klog.Errorf("Failed to query history for metric %v: %v", workloadCpuLims.BuildUniqueKey(), err)
+			//	continue
+			//}
+			//wkMemReqTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadMemReqs, qRange.Start, qRange.End, qRange.Step)
+			//if err != nil {
+			//	klog.Errorf("Failed to query history for metric %v: %v", workloadMemReqs.BuildUniqueKey(), err)
+			//	continue
+			//}
+			//wkMemLimTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadMemLims, qRange.Start, qRange.End, qRange.Step)
+			//if err != nil {
+			//	klog.Errorf("Failed to query history for metric %v: %v", workloadMemLims.BuildUniqueKey(), err)
+			//	continue
+			//}
+			//wkReplicasTs, err := c.dataSource.QueryTimeSeries(context.TODO(), workloadReplicas, qRange.Start, qRange.End, qRange.Step)
+			//if err != nil {
+			//	klog.Errorf("Failed to query history for metric %v: %v", workloadReplicas.BuildUniqueKey(), err)
+			//	continue
+			//}
+			setter(kind, nn, &RawWorkloadTimeSeriesData{
+				Cpu: wkCpuUsageTs,
+				Mem: wkMemUsageTs,
+				//CpuRequests: wkCpuReqTs,
+				//MemRequests: wkMemReqTs,
+				//CpuLimits:   wkCpuLimTs,
+				//MemLimits:   wkMemLimTs,
+				//Replicas:    wkReplicasTs,
+			})
+		}
+		klog.Infof("fetchWorkloadMetricData worker %v exit", i)
+	}
+
+	for i := 0; i < c.config.Workers; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+
+	for _, kindWorkloads := range workloads {
+		for _, workload := range kindWorkloads {
+			target := &v1.ObjectReference{
+				Kind:       workload.Workload.GetKind(),
+				Namespace:  workload.Workload.GetNamespace(),
+				Name:       workload.Workload.GetName(),
+				APIVersion: workload.Workload.GetAPIVersion(),
+			}
+			targetsChan <- target
+		}
+	}
+	close(targetsChan)
+
+	wg.Wait()
+
+	klog.Infof("fetchWorkloadMetricData all workers finished")
+
 	return results
 }
 
@@ -1272,70 +1344,105 @@ func (c *Comparator) fetchContainerData() map[string] /*kind*/ map[types.Namespa
 	results := make(map[string]map[types.NamespacedName]map[string]*RawContainerTimeSeriesData)
 	workloads := c.workloadsSpecCache
 	qRange := c.getQueryRange()
-	for kind := range workloads {
-		if kindWorkloads, ok := workloads[kind]; ok {
-			kindResult, ok := results[kind]
-			if !ok {
-				kindResult = make(map[types.NamespacedName]map[string]*RawContainerTimeSeriesData)
-				results[kind] = kindResult
-			}
-			for nn, workload := range kindWorkloads {
-				workloadResult, ok := kindResult[nn]
-				if !ok {
-					workloadResult = make(map[string]*RawContainerTimeSeriesData)
-					kindResult[nn] = workloadResult
+	type Item struct {
+		kind          string
+		nn            types.NamespacedName
+		containerName string
+		data          *RawContainerTimeSeriesData
+	}
+	var lock sync.Mutex
+	var wg sync.WaitGroup
+	itemsChan := make(chan *Item, 10240)
+
+	setter := func(kind string, nn types.NamespacedName, containerName string, data *RawContainerTimeSeriesData) {
+		lock.Lock()
+		defer lock.Unlock()
+
+		kindResult, ok := results[kind]
+		if !ok {
+			kindResult = make(map[types.NamespacedName]map[string]*RawContainerTimeSeriesData)
+			results[kind] = kindResult
+		}
+		workloadResult, ok := kindResult[nn]
+		if !ok {
+			workloadResult = make(map[string]*RawContainerTimeSeriesData)
+			kindResult[nn] = workloadResult
+		}
+		results[kind][nn][containerName] = data
+	}
+
+	worker := func(i int) {
+		defer wg.Done()
+		for item := range itemsChan {
+			setter(item.kind, item.nn, item.containerName, item.data)
+		}
+		klog.Infof("fetchContainerData worker %v exit", i)
+	}
+
+	for i := 0; i < c.config.Workers; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+	for kind, kindWorkloads := range workloads {
+		for nn, workload := range kindWorkloads {
+			for _, container := range workload.PodRef.Spec.Containers {
+				cpu := metricnaming.ResourceToContainerMetricNamer(c.config.ClusterId, nn.Namespace, nn.Name, container.Name, v1.ResourceCPU)
+				mem := metricnaming.ResourceToContainerMetricNamer(c.config.ClusterId, nn.Namespace, nn.Name, container.Name, v1.ResourceMemory)
+				//cpuRequest := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricCpuRequest, labels.Everything())
+				//memRequest := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricMemRequest, labels.Everything())
+				//cpuLimit := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricCpuLimit, labels.Everything())
+				//memLimit := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricMemLimit, labels.Everything())
+
+				cpuTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), cpu, qRange.Start, qRange.End, qRange.Step)
+				if err != nil {
+					klog.Errorf("Failed to query history for metric %v: %v", cpu.BuildUniqueKey(), err)
+					continue
 				}
-				for _, container := range workload.PodRef.Spec.Containers {
-					cpu := metricnaming.ResourceToContainerMetricNamer(c.config.ClusterId, nn.Namespace, nn.Name, container.Name, v1.ResourceCPU)
-					mem := metricnaming.ResourceToContainerMetricNamer(c.config.ClusterId, nn.Namespace, nn.Name, container.Name, v1.ResourceMemory)
-					cpuRequest := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricCpuRequest, labels.Everything())
-					memRequest := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricMemRequest, labels.Everything())
-					cpuLimit := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricCpuLimit, labels.Everything())
-					memLimit := metricnaming.ContainerMetricNamer(c.config.ClusterId, kind, nn.Namespace, nn.Name, container.Name, consts.MetricMemLimit, labels.Everything())
-
-					cpuTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), cpu, qRange.Start, qRange.End, qRange.Step)
-					if err != nil {
-						klog.Errorf("Failed to query history for metric %v: %v", cpu.BuildUniqueKey(), err)
-						continue
-					}
-					memTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), mem, qRange.Start, qRange.End, qRange.Step)
-					if err != nil {
-						klog.Errorf("Failed to query history for metric %v: %v", mem.BuildUniqueKey(), err)
-						continue
-					}
-					cpuReqTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), cpuRequest, qRange.Start, qRange.End, qRange.Step)
-					if err != nil {
-						klog.Errorf("Failed to query history for metric %v: %v", cpuRequest.BuildUniqueKey(), err)
-						continue
-					}
-					memReqTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), memRequest, qRange.Start, qRange.End, qRange.Step)
-					if err != nil {
-						klog.Errorf("Failed to query history for metric %v: %v", memRequest.BuildUniqueKey(), err)
-						continue
-					}
-					cpuLimTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), cpuLimit, qRange.Start, qRange.End, qRange.Step)
-					if err != nil {
-						klog.Errorf("Failed to query history for metric %v: %v", cpuLimit.BuildUniqueKey(), err)
-						continue
-					}
-					memLimTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), memLimit, qRange.Start, qRange.End, qRange.Step)
-					if err != nil {
-						klog.Errorf("Failed to query history for metric %v: %v", memLimit.BuildUniqueKey(), err)
-						continue
-					}
-					workloadResult[container.Name] = &RawContainerTimeSeriesData{
-						Cpu:         cpuTsList,
-						Mem:         memTsList,
-						CpuRequests: cpuReqTsList,
-						MemRequests: memReqTsList,
-						CpuLimits:   cpuLimTsList,
-						MemLimits:   memLimTsList,
-					}
-
+				memTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), mem, qRange.Start, qRange.End, qRange.Step)
+				if err != nil {
+					klog.Errorf("Failed to query history for metric %v: %v", mem.BuildUniqueKey(), err)
+					continue
+				}
+				//cpuReqTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), cpuRequest, qRange.Start, qRange.End, qRange.Step)
+				//if err != nil {
+				//	klog.Errorf("Failed to query history for metric %v: %v", cpuRequest.BuildUniqueKey(), err)
+				//	continue
+				//}
+				//memReqTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), memRequest, qRange.Start, qRange.End, qRange.Step)
+				//if err != nil {
+				//	klog.Errorf("Failed to query history for metric %v: %v", memRequest.BuildUniqueKey(), err)
+				//	continue
+				//}
+				//cpuLimTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), cpuLimit, qRange.Start, qRange.End, qRange.Step)
+				//if err != nil {
+				//	klog.Errorf("Failed to query history for metric %v: %v", cpuLimit.BuildUniqueKey(), err)
+				//	continue
+				//}
+				//memLimTsList, err := c.dataSource.QueryTimeSeries(context.TODO(), memLimit, qRange.Start, qRange.End, qRange.Step)
+				//if err != nil {
+				//	klog.Errorf("Failed to query history for metric %v: %v", memLimit.BuildUniqueKey(), err)
+				//	continue
+				//}
+				itemsChan <- &Item{
+					kind:          kind,
+					nn:            nn,
+					containerName: container.Name,
+					data: &RawContainerTimeSeriesData{
+						Cpu: cpuTsList,
+						Mem: memTsList,
+						//CpuRequests: cpuReqTsList,
+						//MemRequests: memReqTsList,
+						//CpuLimits:   cpuLimTsList,
+						//MemLimits:   memLimTsList,
+					},
 				}
 			}
 		}
 	}
+
+	close(itemsChan)
+	wg.Wait()
+	klog.Infof("fetchContainerData all workers finished")
 	return results
 }
 
@@ -1359,13 +1466,20 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 		}
 		for nn, workloadPodSpec := range workloads[kind] {
 			wrd := &spec.WorkloadRecommendedData{
-				Containers: make(map[string]*spec.ContainerRecommendedData),
+				Containers:                make(map[string]*spec.ContainerRecommendedData),
+				RecContainers:             make(map[string]*spec.RecContainerData),
+				RecMaxContainers:          make(map[string]*spec.RecContainerData),
+				RecMaxMarginContainers:    make(map[string]*spec.RecContainerData),
+				RecPercentileContainers:   make(map[string]*spec.RecContainerData),
+				RecReqSameLimitContainers: make(map[string]*spec.RecContainerData),
 			}
 
+			directPod := workloadPodSpec.PodRef.DeepCopy()
 			recPod := workloadPodSpec.PodRef.DeepCopy()
 			pertRecPod := workloadPodSpec.PodRef.DeepCopy()
 			maxRecPod := workloadPodSpec.PodRef.DeepCopy()
 			maxMarginRecPod := workloadPodSpec.PodRef.DeepCopy()
+			requestSameLimitMMRecPod := workloadPodSpec.PodRef.DeepCopy()
 
 			for _, container := range workloadPodSpec.PodRef.Spec.Containers {
 				kindWorkloadsContainerData, ok := workloadsContainerData[kind]
@@ -1408,8 +1522,8 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 						cpuReqLimRatio = float64(originalCpuLim.MilliValue()) / float64(originalCpuReq.MilliValue())
 					}
 
-					originalMemReq, ok1 := container.Resources.Requests[v1.ResourceCPU]
-					originalMemLim, ok2 := container.Resources.Limits[v1.ResourceCPU]
+					originalMemReq, ok1 := container.Resources.Requests[v1.ResourceMemory]
+					originalMemLim, ok2 := container.Resources.Limits[v1.ResourceMemory]
 					if ok1 && ok2 {
 						memReqLimRatio = float64(originalMemLim.MilliValue()) / float64(originalMemReq.MilliValue())
 					}
@@ -1428,13 +1542,19 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 							recPod.Spec.Containers[i].Resources.Requests = requests
 							if recPod.Spec.Containers[i].Resources.Limits != nil {
 								// keep original resources behavior
-								if _, ok := recPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
+								if origCpuLim, ok := recPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
 									limCpu := resource.NewMilliQuantity(int64(*cpuStatistics.Recommended*cpuReqLimRatio*1000), resource.DecimalSI)
+									if limCpu.Cmp(origCpuLim) > 0 {
+										limCpu = &origCpuLim
+									}
 									recPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU] = *limCpu
 								}
 
-								if _, ok := recPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
+								if origMemLim, ok := recPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
 									limMem := resource.NewQuantity(int64(*memStatistics.Recommended*memReqLimRatio), resource.BinarySI)
+									if limMem.Cmp(origMemLim) > 0 {
+										limMem = &origMemLim
+									}
 									recPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory] = *limMem
 								}
 							}
@@ -1451,13 +1571,19 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 
 							if maxRecPod.Spec.Containers[i].Resources.Limits != nil {
 								// keep original resources behavior
-								if _, ok := maxRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
+								if origCpuLim, ok := maxRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
 									limCpu := resource.NewMilliQuantity(int64(*cpuStatistics.Max*cpuReqLimRatio*1000), resource.DecimalSI)
+									if limCpu.Cmp(origCpuLim) > 0 {
+										limCpu = &origCpuLim
+									}
 									maxRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU] = *limCpu
 								}
 
-								if _, ok := maxRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
+								if origMemLim, ok := maxRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
 									limMem := resource.NewQuantity(int64(*memStatistics.Max*memReqLimRatio), resource.BinarySI)
+									if limMem.Cmp(origMemLim) > 0 {
+										limMem = &origMemLim
+									}
 									maxRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory] = *limMem
 								}
 							}
@@ -1471,16 +1597,24 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 								v1.ResourceMemory: *maxMarginRecMem,
 							}
 							maxMarginRecPod.Spec.Containers[i].Resources.Requests = resourceList
+							requestSameLimitMMRecPod.Spec.Containers[i].Resources.Requests = resourceList
+							requestSameLimitMMRecPod.Spec.Containers[i].Resources.Limits = resourceList
 
 							if maxMarginRecPod.Spec.Containers[i].Resources.Limits != nil {
 								// keep original resources behavior
-								if _, ok := maxMarginRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
+								if origCpuLim, ok := maxMarginRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
 									limCpu := resource.NewMilliQuantity(int64(*cpuStatistics.MaxRecommended*cpuReqLimRatio*1000), resource.DecimalSI)
+									if limCpu.Cmp(origCpuLim) > 0 {
+										limCpu = &origCpuLim
+									}
 									maxMarginRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU] = *limCpu
 								}
 
-								if _, ok := maxMarginRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
+								if origMemLim, ok := maxMarginRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
 									limMem := resource.NewQuantity(int64(*memStatistics.MaxRecommended*memReqLimRatio), resource.BinarySI)
+									if limMem.Cmp(origMemLim) > 0 {
+										limMem = &origMemLim
+									}
 									maxMarginRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory] = *limMem
 								}
 							}
@@ -1497,13 +1631,19 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 
 							if pertRecPod.Spec.Containers[i].Resources.Limits != nil {
 								// keep original resources behavior
-								if _, ok := pertRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
+								if origCpuLim, ok := pertRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU]; ok {
 									limCpu := resource.NewMilliQuantity(int64(*cpuStatistics.Percentile*cpuReqLimRatio*1000), resource.DecimalSI)
+									if limCpu.Cmp(origCpuLim) > 0 {
+										limCpu = &origCpuLim
+									}
 									pertRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceCPU] = *limCpu
 								}
 
-								if _, ok := pertRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
+								if origMemLim, ok := pertRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory]; ok {
 									limMem := resource.NewQuantity(int64(*memStatistics.Percentile*memReqLimRatio), resource.BinarySI)
+									if limMem.Cmp(origMemLim) > 0 {
+										limMem = &origMemLim
+									}
 									pertRecPod.Spec.Containers[i].Resources.Limits[v1.ResourceMemory] = *limMem
 								}
 							}
@@ -1517,18 +1657,180 @@ func (c *Comparator) GetAllWorkloadRecommendedData() map[string]map[types.Namesp
 
 			maxRecSpec := c.baselineCloud.Pod2ServerlessSpec(maxRecPod)
 			maxRecSpec.PodRef = maxRecPod
-			wrd.MaxRecommendedSpec = &maxRecSpec
+			wrd.MaxRecommendedSpec = maxRecSpec
 			wrd.MaxRecommendedSpec.GoodsNum = workloadPodSpec.GoodsNum
 
 			maxMarginRecSpec := c.baselineCloud.Pod2ServerlessSpec(maxMarginRecPod)
 			maxMarginRecSpec.PodRef = maxMarginRecPod
-			wrd.MaxMarginRecommendedSpec = &maxMarginRecSpec
+			wrd.MaxMarginRecommendedSpec = maxMarginRecSpec
 			wrd.MaxMarginRecommendedSpec.GoodsNum = workloadPodSpec.GoodsNum
 
 			percentRecSpec := c.baselineCloud.Pod2ServerlessSpec(pertRecPod)
 			percentRecSpec.PodRef = pertRecPod
-			wrd.PercentRecommendedSpec = &percentRecSpec
+			wrd.PercentRecommendedSpec = percentRecSpec
 			wrd.PercentRecommendedSpec.GoodsNum = workloadPodSpec.GoodsNum
+
+			requestSameLimitMMRecPodSpec := c.baselineCloud.Pod2ServerlessSpec(requestSameLimitMMRecPod)
+			requestSameLimitMMRecPodSpec.PodRef = requestSameLimitMMRecPod
+			wrd.RequestSameLimitRecommendedSpec = requestSameLimitMMRecPodSpec
+			wrd.RequestSameLimitRecommendedSpec.GoodsNum = workloadPodSpec.GoodsNum
+
+			directPodSpec := c.baselineCloud.Pod2ServerlessSpec(directPod)
+			directPodSpec.PodRef = directPod
+			wrd.DirectSpec = directPodSpec
+			wrd.DirectSpec.GoodsNum = workloadPodSpec.GoodsNum
+
+			for _, container := range wrd.RecommendedSpec.PodRef.Spec.Containers {
+				cpuReqQ := container.Resources.Requests.Cpu()
+				memReqQ := container.Resources.Requests.Memory()
+				cpuLimQ := container.Resources.Limits.Cpu()
+				memLimQ := container.Resources.Limits.Memory()
+				cpuReq := -1.0
+				memReq := -1.0
+				cpuLim := -1.0
+				memLim := -1.0
+				if cpuReqQ != nil {
+					cpuReq = float64(cpuReqQ.MilliValue()) / 1000.
+				}
+				if memReqQ != nil {
+					memReq = float64(memReqQ.Value()) / consts.GB
+				}
+				if cpuLimQ != nil {
+					cpuLim = float64(cpuLimQ.MilliValue()) / 1000.
+				}
+				if memLimQ != nil {
+					memLim = float64(memLimQ.Value()) / consts.GB
+				}
+				wrd.RecContainers[container.Name] = &spec.RecContainerData{
+					ContainerName:        container.Name,
+					CpuReq:               cpuReq,
+					MemReq:               memReq,
+					CpuLim:               cpuLim,
+					MemLim:               memLim,
+					ResourceRequirements: container.Resources,
+				}
+			}
+			for _, container := range wrd.MaxRecommendedSpec.PodRef.Spec.Containers {
+				cpuReqQ := container.Resources.Requests.Cpu()
+				memReqQ := container.Resources.Requests.Memory()
+				cpuLimQ := container.Resources.Limits.Cpu()
+				memLimQ := container.Resources.Limits.Memory()
+				cpuReq := -1.0
+				memReq := -1.0
+				cpuLim := -1.0
+				memLim := -1.0
+				if cpuReqQ != nil {
+					cpuReq = float64(cpuReqQ.MilliValue()) / 1000.
+				}
+				if memReqQ != nil {
+					memReq = float64(memReqQ.Value()) / consts.GB
+				}
+				if cpuLimQ != nil {
+					cpuLim = float64(cpuLimQ.MilliValue()) / 1000.
+				}
+				if memLimQ != nil {
+					memLim = float64(memLimQ.Value()) / consts.GB
+				}
+				wrd.RecMaxContainers[container.Name] = &spec.RecContainerData{
+					ContainerName:        container.Name,
+					CpuReq:               cpuReq,
+					MemReq:               memReq,
+					CpuLim:               cpuLim,
+					MemLim:               memLim,
+					ResourceRequirements: container.Resources,
+				}
+			}
+			for _, container := range wrd.MaxMarginRecommendedSpec.PodRef.Spec.Containers {
+				cpuReqQ := container.Resources.Requests.Cpu()
+				memReqQ := container.Resources.Requests.Memory()
+				cpuLimQ := container.Resources.Limits.Cpu()
+				memLimQ := container.Resources.Limits.Memory()
+				cpuReq := -1.0
+				memReq := -1.0
+				cpuLim := -1.0
+				memLim := -1.0
+				if cpuReqQ != nil {
+					cpuReq = float64(cpuReqQ.MilliValue()) / 1000.
+				}
+				if memReqQ != nil {
+					memReq = float64(memReqQ.Value()) / consts.GB
+				}
+				if cpuLimQ != nil {
+					cpuLim = float64(cpuLimQ.MilliValue()) / 1000.
+				}
+				if memLimQ != nil {
+					memLim = float64(memLimQ.Value()) / consts.GB
+				}
+				wrd.RecMaxMarginContainers[container.Name] = &spec.RecContainerData{
+					ContainerName:        container.Name,
+					CpuReq:               cpuReq,
+					MemReq:               memReq,
+					CpuLim:               cpuLim,
+					MemLim:               memLim,
+					ResourceRequirements: container.Resources,
+				}
+			}
+			for _, container := range wrd.PercentRecommendedSpec.PodRef.Spec.Containers {
+				cpuReqQ := container.Resources.Requests.Cpu()
+				memReqQ := container.Resources.Requests.Memory()
+				cpuLimQ := container.Resources.Limits.Cpu()
+				memLimQ := container.Resources.Limits.Memory()
+				cpuReq := -1.0
+				memReq := -1.0
+				cpuLim := -1.0
+				memLim := -1.0
+				if cpuReqQ != nil {
+					cpuReq = float64(cpuReqQ.MilliValue()) / 1000.
+				}
+				if memReqQ != nil {
+					memReq = float64(memReqQ.Value()) / consts.GB
+				}
+				if cpuLimQ != nil {
+					cpuLim = float64(cpuLimQ.MilliValue()) / 1000.
+				}
+				if memLimQ != nil {
+					memLim = float64(memLimQ.Value()) / consts.GB
+				}
+				wrd.RecPercentileContainers[container.Name] = &spec.RecContainerData{
+					ContainerName:        container.Name,
+					CpuReq:               cpuReq,
+					MemReq:               memReq,
+					CpuLim:               cpuLim,
+					MemLim:               memLim,
+					ResourceRequirements: container.Resources,
+				}
+			}
+			for _, container := range wrd.RequestSameLimitRecommendedSpec.PodRef.Spec.Containers {
+				cpuReqQ := container.Resources.Requests.Cpu()
+				memReqQ := container.Resources.Requests.Memory()
+				cpuLimQ := container.Resources.Limits.Cpu()
+				memLimQ := container.Resources.Limits.Memory()
+				cpuReq := -1.0
+				memReq := -1.0
+				cpuLim := -1.0
+				memLim := -1.0
+				if cpuReqQ != nil {
+					cpuReq = float64(cpuReqQ.MilliValue()) / 1000.
+				}
+				if memReqQ != nil {
+					memReq = float64(memReqQ.Value()) / consts.GB
+				}
+				if cpuLimQ != nil {
+					cpuLim = float64(cpuLimQ.MilliValue()) / 1000.
+				}
+				if memLimQ != nil {
+					memLim = float64(memLimQ.Value()) / consts.GB
+				}
+				wrd.RecReqSameLimitContainers[container.Name] = &spec.RecContainerData{
+					ContainerName:        container.Name,
+					CpuReq:               cpuReq,
+					MemReq:               memReq,
+					CpuLim:               cpuLim,
+					MemLim:               memLim,
+					ResourceRequirements: container.Resources,
+				}
+			}
+
 			if klog.V(7).Enabled() {
 				data, _ := jsoniter.Marshal(wrd)
 				klog.V(7).Infof("Workload %v, %s", nn, wrd, string(data))

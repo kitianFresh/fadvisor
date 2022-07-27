@@ -1,4 +1,4 @@
-package metricserver
+package barad
 
 import (
 	"github.com/gocrane/fadvisor/pkg/metricquery"
@@ -11,7 +11,7 @@ type builder struct {
 	metric *metricquery.Metric
 }
 
-func NewMetricServerQueryBuilder(metric *metricquery.Metric) querybuilder.Builder {
+func NewBaradQueryBuilder(metric *metricquery.Metric) querybuilder.Builder {
 	return &builder{
 		metric: metric,
 	}
@@ -23,11 +23,11 @@ func (b builder) BuildQuery(behavior querybuilder.BuildQueryBehavior) (*metricqu
 
 func metricServerQuery(query *metricquery.GenericQuery) *metricquery.Query {
 	return &metricquery.Query{
-		Type:         metricquery.MetricServerMetricSource,
+		Type:         metricquery.BaradMetricSource,
 		GenericQuery: query,
 	}
 }
 
 func init() {
-	querybuilder.RegisterBuilderFactory(metricquery.MetricServerMetricSource, NewMetricServerQueryBuilder)
+	querybuilder.RegisterBuilderFactory(metricquery.BaradMetricSource, NewBaradQueryBuilder)
 }

@@ -97,7 +97,7 @@ func (f *targetInfoFetcher) FetchSelector(target *corev1.ObjectReference) (label
 func (f *targetInfoFetcher) getLabelSelectorFromScale(groupKind schema.GroupKind, namespace, name string) (labels.Selector, error) {
 	mappings, err := f.RestMapper.RESTMappings(groupKind)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("restmapping failed: %v", err)
 	}
 
 	var errs []error
@@ -114,7 +114,7 @@ func (f *targetInfoFetcher) getLabelSelectorFromScale(groupKind schema.GroupKind
 			}
 			return selector, nil
 		}
-		errs = append(errs, err)
+		errs = append(errs, fmt.Errorf("groupResource: %v, err: %v", groupResource, err))
 	}
 	return nil, fmt.Errorf("%+v", errs)
 }

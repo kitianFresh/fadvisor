@@ -7,10 +7,6 @@ import (
 	"github.com/gocrane/fadvisor/pkg/cloud"
 )
 
-type Pod2EKSSpecConverter interface {
-	Pod2EKSSpecConverter(pod *v1.Pod) (v1.ResourceList, error)
-}
-
 type EKSPlatform struct {
 }
 
@@ -46,6 +42,9 @@ const (
 )
 
 func EKSPodCpuType(pod *v1.Pod) string {
+	if pod == nil {
+		return ""
+	}
 	if pod.Annotations == nil {
 		//default
 		return EKSCpuTypeValue_Intel
@@ -54,6 +53,9 @@ func EKSPodCpuType(pod *v1.Pod) string {
 }
 
 func EKSPodGpuType(pod *v1.Pod) (bool, string) {
+	if pod == nil {
+		return false, ""
+	}
 	if pod.Annotations == nil {
 		return false, ""
 	}
@@ -62,6 +64,9 @@ func EKSPodGpuType(pod *v1.Pod) (bool, string) {
 }
 
 func EKSPodGpuCount(pod *v1.Pod) (bool, string) {
+	if pod == nil {
+		return false, ""
+	}
 	if pod.Annotations == nil {
 		return false, ""
 	}
@@ -70,6 +75,9 @@ func EKSPodGpuCount(pod *v1.Pod) (bool, string) {
 }
 
 func EKSPodCpuValue(pod *v1.Pod) (bool, string) {
+	if pod == nil {
+		return false, ""
+	}
 	if pod.Annotations == nil {
 		return false, ""
 	}
@@ -78,6 +86,9 @@ func EKSPodCpuValue(pod *v1.Pod) (bool, string) {
 }
 
 func EKSPodMemValue(pod *v1.Pod) (bool, string) {
+	if pod == nil {
+		return false, ""
+	}
 	if pod.Annotations == nil {
 		return false, ""
 	}

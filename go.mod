@@ -4,15 +4,18 @@ go 1.16
 
 require (
 	github.com/evanphx/json-patch v4.11.0+incompatible
+	github.com/go-gota/gota v0.12.0
 	github.com/go-logr/logr v0.4.0
 	github.com/gocrane/crane v0.3.0
 	github.com/json-iterator/go v1.1.12
 	github.com/montanaflynn/stats v0.6.6
 	github.com/olekukonko/tablewriter v0.0.4
+	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.11.0
 	github.com/prometheus/common v0.26.0
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/pflag v1.0.5
+	github.com/taosdata/driver-go/v2 v2.0.3
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.383
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/cvm v1.0.309
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/monitor v1.0.371

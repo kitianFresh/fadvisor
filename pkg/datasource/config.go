@@ -53,6 +53,7 @@ type MockConfig struct {
 type QCloudMonitorConfig struct {
 	Credentials   `name:"credentials" value:"optional"`
 	ClientProfile `name:"clientProfile" value:"optional"`
+	StsConfig     `name:"stsConfig" value:"optional"`
 }
 
 // Credentials use user defined SecretId and SecretKey
@@ -63,6 +64,14 @@ type Credentials struct {
 	SecretKey string
 }
 
+type StsConfig struct {
+	Enable       bool
+	Uin          string
+	StsSecretId  string
+	StsSecretKey string
+	Endpoint     string
+}
+
 type ClientProfile struct {
 	Debug                 bool
 	DefaultLimit          int64
@@ -71,6 +80,9 @@ type ClientProfile struct {
 	Region                string
 	DomainSuffix          string
 	Scheme                string
+}
+
+type BaradConfig struct {
 }
 
 type DataSourceType string

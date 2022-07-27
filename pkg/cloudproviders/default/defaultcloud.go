@@ -21,6 +21,14 @@ type DefaultCloud struct {
 	cache cache.Cache
 }
 
+func (tc *DefaultCloud) ServerlessPodPriceByContext(param cloud.ResourceParam) (*cloud.Pod, error) {
+	panic("implement me")
+}
+
+func (tc *DefaultCloud) Pod2ServerlessSpecByContext(pod *v1.Pod, param cloud.PodSpecConverterParam) spec.CloudPodSpec {
+	panic("implement me")
+}
+
 func NewDefaultCloud(config *cloud.PriceConfig, cache cache.Cache) cloud.Cloud {
 	return &DefaultCloud{
 		priceConfig: config,
@@ -33,7 +41,15 @@ func (tc *DefaultCloud) Pod2ServerlessSpec(pod *v1.Pod) spec.CloudPodSpec {
 }
 
 func (tc *DefaultCloud) NodePrice(spec spec.CloudNodeSpec) (*cloud.Node, error) {
-	panic("implement me")
+	cfg, err := tc.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("provider config is null")
+	}
+
+	return tc.getDefaultNodePrice(cfg, spec.NodeRef)
 }
 
 func (tc *DefaultCloud) ServerlessPodPrice(spec spec.CloudPodSpec) (*cloud.Pod, error) {
@@ -57,7 +73,7 @@ func (tc *DefaultCloud) Node2Spec(node *v1.Node) spec.CloudNodeSpec {
 }
 
 func (tc *DefaultCloud) IsServerlessPod(pod *v1.Pod) bool {
-	panic("implement me")
+	return false
 }
 
 func (tc *DefaultCloud) OnNodeDelete(node *v1.Node) error {
@@ -99,7 +115,7 @@ func (tc *DefaultCloud) getDefaultNodePrice(cfg *cloud.CustomPricing, node *v1.N
 	region := cfg.Region
 	cpuCores := node.Status.Capacity[v1.ResourceCPU]
 	memory := node.Status.Capacity[v1.ResourceMemory]
-	cpu := float64(cpuCores.Value())
+	cpu := float64(cpuCores.MilliValue() / 1000.)
 	mem := float64(memory.Value())
 	return &cloud.Node{
 		BaseInstancePrice: cloud.BaseInstancePrice{

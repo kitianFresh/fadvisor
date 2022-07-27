@@ -237,8 +237,8 @@ func TestBuildQuery(t *testing.T) {
 		if !reflect.DeepEqual(err, tc.err) {
 			t.Fatalf("tc %v failed, got error: %v, want error: %v", tc.desc, err, tc.err)
 		}
-		if !reflect.DeepEqual(query.MetricServer, tc.want) {
-			t.Fatalf("tc %v failed, got: %v, want: %v", tc.desc, query.MetricServer, tc.want)
+		if !reflect.DeepEqual(query.GenericQuery, tc.want) {
+			t.Fatalf("tc %v failed, got: %v, want: %v", tc.desc, query.GenericQuery, tc.want)
 		}
 	}
 }

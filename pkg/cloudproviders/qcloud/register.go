@@ -37,7 +37,7 @@ func registerTencent(cloudConfig io.Reader, priceConfig *cloud.PriceConfig, cach
 	if qcloudClientConfig.Region == "" {
 		return nil, fmt.Errorf("no region info found. must specify region for provider %v", qcloudClientConfig.Region)
 	}
-	klog.V(4).Infof("Cloud config detail: %+v", qcloudClientConfig.QCloudClientProfile)
+	klog.V(4).Infof("Cloud config detail QCloudClientProfile: %+v, ", qcloudClientConfig.QCloudClientProfile)
 	p := NewTencentCloud(qcloudClientConfig, priceConfig, *cache)
 	return p, nil
 }
@@ -56,9 +56,16 @@ func buildClientConfig(cloudConfig io.Reader) (*qcloudsdk.QCloudClientConfig, er
 		Region:          cfg.Region,
 		DomainSuffix:    cfg.DomainSuffix,
 		Scheme:          cfg.Scheme,
+		LocalTKE:        cfg.LocalTKE,
 	}
 
-	cred := credential.NewQCloudCredential(cfg.ClusterId, cfg.AppId, cfg.SecretId, cfg.SecretKey, 1*time.Hour)
+	var cred credential.QCloudCredential
+	klog.Infof("cloudConfig %+v", cfg)
+	if cfg.StsConfig.Enable {
+		cred = credential.NewSTSCredential(cfg.Region, cfg.ClusterId, cfg.AppId, cfg.Uin, cfg.StsSecretId, cfg.StsSecretKey, cfg.Endpoint, 1*time.Hour)
+	} else {
+		cred = credential.NewQCloudCredential(cfg.ClusterId, cfg.AppId, cfg.SecretId, cfg.SecretKey, 1*time.Hour)
+	}
 	qcc := &qcloudsdk.QCloudClientConfig{
 		RateLimiter:         flowcontrol.NewTokenBucketRateLimiter(5, 1),
 		DefaultRetryCnt:     consts.MAXRETRY,

@@ -25,7 +25,7 @@ const (
 
 var (
 	// Namesapce
-	MetricsNamespace = "QCE/TKE"
+	MetricsNamespace = "QCE/TKE2"
 	MetricsModule    = "monitor"
 
 	/**
@@ -236,6 +236,7 @@ func (qcc *QCloudMonitorClient) DescribeStatisticDataWithRetry(cli *cm.Client, r
 		start := time.Now()
 		resp, err := cli.DescribeStatisticData(request.(*cm.DescribeStatisticDataRequest))
 		if err != nil {
+			klog.Error(err)
 			metrics.ComponentWrongRequestStatics(req.GetDomain(), req.GetAction(), err.Error(), req.GetVersion())
 		} else {
 			metrics.ComponentRequestStatics(req.GetDomain(), req.GetAction(), 200, "", req.GetVersion(), start)

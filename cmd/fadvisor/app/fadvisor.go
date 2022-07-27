@@ -156,7 +156,7 @@ func RunComparator(ctx context.Context, opts *options.Options) error {
 		hybrid)
 
 	comparator.Init()
-	comparator.DoAnalysis()
+	comparator.DoAnalysisV1()
 	return nil
 }
 

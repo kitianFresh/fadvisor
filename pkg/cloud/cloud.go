@@ -2,6 +2,7 @@ package cloud
 
 import (
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"reflect"
 	"strconv"
 	"strings"
@@ -32,9 +33,23 @@ type CloudCacher interface {
 	Refresh()
 }
 
+type PodSpecConverterParam struct {
+	Enable          bool
+	ChargeTypeForce bool
+	ChargeType      string
+	MachineType     string
+	// 未规整化过的cpu mem
+	RawCpu resource.Quantity
+	RawMem resource.Quantity
+	RawGPU resource.Quantity
+}
+
 type PodSpecConverter interface {
 	Pod2Spec(pod *v1.Pod) spec.CloudPodSpec
+	// for pod which is in vk node
 	Pod2ServerlessSpec(pod *v1.Pod) spec.CloudPodSpec
+	// used for non-serverless pod with no serverless annotations, use extra param to replace
+	Pod2ServerlessSpecByContext(pod *v1.Pod, param PodSpecConverterParam) spec.CloudPodSpec
 }
 
 type NodeSpecConverter interface {

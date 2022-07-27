@@ -12,10 +12,12 @@ import (
 
 // ComparatorOptions used for fadvisor cost comparator
 type ComparatorOptions struct {
-	Config      comparatorcfg.Config
-	DataSource  string
-	CustomPrice cloud.CustomPricing
-	CloudConfig cloud.CloudConfig
+	Config            comparatorcfg.Config
+	DataSource        string
+	CustomPrice       cloud.CustomPricing
+	CloudConfig       cloud.CloudConfig
+	TargetCustomPrice cloud.CustomPricing
+	TargetCloudConfig cloud.CloudConfig
 	// DataSourcePromConfig is the prometheus datasource config
 	DataSourcePromConfig datasource.PromConfig
 	// DataSourceQMonitorConfig is the tencent cloud monitor datasource config
@@ -52,6 +54,7 @@ func (o *ComparatorOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.Config.EnableWorkloadTimeSeries, "comparator-enable-workload-ts", false, "enable workload time series fetching, it will fetch workload time series data")
 	fs.BoolVar(&o.Config.EnableWorkloadCheckpoint, "comparator-enable-workload-ts-checkpoint", false, "enable workload time series data checkpoint")
 	fs.StringVar(&o.Config.DataPath, "comparator-data-path", ".", "data path of the report and checkpoint data stored")
+	fs.IntVar(&o.Config.Workers, "comparator-workers", 8, "comparator workers to request pod workload")
 
 	fs.StringVar(&o.DataSource, "datasource", "prom", "data source of the estimator, prom, qmonitor is available")
 	fs.StringVar(&o.DataSourcePromConfig.Address, "prometheus-address", "", "prometheus address")

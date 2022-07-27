@@ -15,6 +15,7 @@ type Config struct {
 	EnableWorkloadTimeSeries  bool
 	EnableWorkloadCheckpoint  bool
 	DataPath                  string
+	Workers                   int
 }
 
 type HistoryAnalyzeConfig struct {

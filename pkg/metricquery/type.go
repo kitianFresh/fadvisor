@@ -14,6 +14,7 @@ const (
 	PrometheusMetricSource    MetricSource = "prom"
 	MetricServerMetricSource  MetricSource = "metricserver"
 	QCloudMonitorMetricSource MetricSource = "qcloudmonitor"
+	BaradMetricSource         MetricSource = "barad"
 )
 
 type MetricType string
@@ -208,10 +209,13 @@ func (m *Metric) keyByPromQL() string {
 
 // Query is used to do query for different data source. you can extends it with your data source query
 type Query struct {
-	Type          MetricSource
-	MetricServer  *MetricServerQuery
-	Prometheus    *PrometheusQuery
-	QCloudMonitor *QCloudMonitorQuery
+	Type         MetricSource
+	GenericQuery *GenericQuery
+	Prometheus   *PrometheusQuery
+}
+
+type GenericQuery struct {
+	Metric *Metric
 }
 
 // MetricServerQuery is used to do query for metric server

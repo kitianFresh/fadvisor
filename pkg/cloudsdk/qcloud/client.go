@@ -583,6 +583,7 @@ type QCloudClientProfile struct {
 	Region          string
 	DomainSuffix    string
 	Scheme          string
+	LocalTKE        bool
 }
 
 type QCloudClientConfig struct {

@@ -22,60 +22,75 @@ func NewRecommenderCoster() *recommender {
 	return &recommender{}
 }
 
-func (e *recommender) TotalCost(costerCtx *CosterContext) (RecommendedCost, RecommendedCost, RecommendedCost, RecommendedCost) {
-	serverlessPodsTotalCost := 0.
+func (e *recommender) TotalCost(costerCtx *CosterContext) (RecommendedCost, RecommendedCost, RecommendedCost, RecommendedCost, RecommendedCost) {
 	timespanInHour := float64(costerCtx.TimeSpanSeconds) / time.Hour.Seconds()
 
-	workloadKindTotalCost := map[string]float64{}
-	for kind, workloadsSpec := range costerCtx.WorkloadsSpec {
-		workloadKindTotalCost[kind] = 0
-		for nn, workloadSpec := range workloadsSpec {
-			workloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadSpec, nn, kind)
-			workloadCost := workloadPrice * timespanInHour
-
-			workloadKindTotalCost[kind] += workloadCost
-			serverlessPodsTotalCost += workloadCost
-		}
-	}
-
-	recWorkloadKindTotalCost := map[string]float64{}
 	recServerlessPodsTotalCost := 0.
 	maxRecServerlessPodsTotalCost := 0.
 	maxMarginServerlessPodsTotalCost := 0.
 	percentServerlessPodsTotalCost := 0.
+	directServerlessPodsTotalCost := 0.
+	requestSameLimitServerlessPodsTotalCost := 0.
+
+	if costerCtx.WorkloadsRecPrices == nil {
+		costerCtx.WorkloadsRecPrices = make(map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ *cloud.WorkloadRecommendedPrice)
+	}
 
 	for kind, workloadsRecSpec := range costerCtx.WorkloadsRecSpec {
-		recWorkloadKindTotalCost[kind] = 0
 		if strings.ToLower(kind) == "daemonset" {
 			continue
 		}
+		kindWorklodsRecPrices, ok := costerCtx.WorkloadsRecPrices[kind]
+		if !ok {
+			kindWorklodsRecPrices = make(map[types.NamespacedName] /*namespace-name*/ *cloud.WorkloadRecommendedPrice)
+			costerCtx.WorkloadsRecPrices[kind] = kindWorklodsRecPrices
+		}
 		for nn, workloadRecSpec := range workloadsRecSpec {
+			workloadRecPrices, ok := kindWorklodsRecPrices[nn]
+			if !ok {
+				workloadRecPrices = &cloud.WorkloadRecommendedPrice{}
+				kindWorklodsRecPrices[nn] = workloadRecPrices
+			}
+
 			recWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadRecSpec.RecommendedSpec, nn, kind)
 			workloadCost := recWorkloadPrice * timespanInHour
-			recWorkloadKindTotalCost[kind] += workloadCost
 			recServerlessPodsTotalCost += workloadCost
+			kindWorklodsRecPrices[nn].RecommendedSpec.TotalPrice = recWorkloadPrice
 
-			if workloadRecSpec.MaxRecommendedSpec != nil {
-				recMaxWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, *workloadRecSpec.MaxRecommendedSpec, nn, kind)
-				recMaxWorkloadCost := recMaxWorkloadPrice * timespanInHour
-				maxRecServerlessPodsTotalCost += recMaxWorkloadCost
-			}
+			directWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadRecSpec.DirectSpec, nn, kind)
+			directWorkloadCost := directWorkloadPrice * timespanInHour
+			directServerlessPodsTotalCost += directWorkloadCost
+			kindWorklodsRecPrices[nn].DirectSpec.TotalPrice = directWorkloadPrice
 
-			if workloadRecSpec.MaxMarginRecommendedSpec != nil {
-				recMaxMarginWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, *workloadRecSpec.MaxMarginRecommendedSpec, nn, kind)
-				recMaxMarginWorkloadCost := recMaxMarginWorkloadPrice * timespanInHour
-				maxMarginServerlessPodsTotalCost += recMaxMarginWorkloadCost
-			}
+			recMaxWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadRecSpec.MaxRecommendedSpec, nn, kind)
+			recMaxWorkloadCost := recMaxWorkloadPrice * timespanInHour
+			maxRecServerlessPodsTotalCost += recMaxWorkloadCost
+			kindWorklodsRecPrices[nn].MaxRecommendedSpec.TotalPrice = recMaxWorkloadPrice
 
-			if workloadRecSpec.PercentRecommendedSpec != nil {
-				percentWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, *workloadRecSpec.PercentRecommendedSpec, nn, kind)
-				percentWorkloadPriceCost := percentWorkloadPrice * timespanInHour
-				percentServerlessPodsTotalCost += percentWorkloadPriceCost
-			}
+			recMaxMarginWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadRecSpec.MaxMarginRecommendedSpec, nn, kind)
+			recMaxMarginWorkloadCost := recMaxMarginWorkloadPrice * timespanInHour
+			maxMarginServerlessPodsTotalCost += recMaxMarginWorkloadCost
+			kindWorklodsRecPrices[nn].MaxMarginRecommendedSpec.TotalPrice = recMaxMarginWorkloadPrice
+
+			percentWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadRecSpec.PercentRecommendedSpec, nn, kind)
+			percentWorkloadPriceCost := percentWorkloadPrice * timespanInHour
+			percentServerlessPodsTotalCost += percentWorkloadPriceCost
+			kindWorklodsRecPrices[nn].PercentRecommendedSpec.TotalPrice = percentWorkloadPrice
+
+			requestSameLimitWorkloadPrice := workloadCosting(costerCtx.Pricer, timespanInHour, workloadRecSpec.RequestSameLimitRecommendedSpec, nn, kind)
+			requestSameLimitWorkloadPriceCost := requestSameLimitWorkloadPrice * timespanInHour
+			requestSameLimitServerlessPodsTotalCost += requestSameLimitWorkloadPriceCost
+			kindWorklodsRecPrices[nn].RequestSameLimitRecommendedSpec.TotalPrice = requestSameLimitWorkloadPrice
 		}
 	}
 
 	platformCost := costerCtx.Pricer.PlatformPrice(cloud.PlatformParameter{Platform: cloud.ServerlessKind})
+
+	dircetCost := RecommendedCost{
+		TotalCost:    directServerlessPodsTotalCost + platformCost.TotalPrice,
+		WorkloadCost: directServerlessPodsTotalCost,
+		PlatformCost: platformCost.TotalPrice,
+	}
 
 	recCost := RecommendedCost{
 		TotalCost:    recServerlessPodsTotalCost + platformCost.TotalPrice,
@@ -101,7 +116,7 @@ func (e *recommender) TotalCost(costerCtx *CosterContext) (RecommendedCost, Reco
 		PlatformCost: platformCost.TotalPrice,
 	}
 
-	return recCost, percentCost, maxRecCost, maxMarginCost
+	return dircetCost, recCost, percentCost, maxRecCost, maxMarginCost
 }
 
 func workloadCosting(pricer cloud.Pricer, timespanInHour float64, recommendedSpec spec.CloudPodSpec, nn types.NamespacedName, kind string) float64 {

@@ -18,13 +18,13 @@ func NewQCloudMonitorQueryBuilder(metric *metricquery.Metric) querybuilder.Build
 }
 
 func (b builder) BuildQuery(behavior querybuilder.BuildQueryBehavior) (*metricquery.Query, error) {
-	return qcloudMonitorQuery(&metricquery.QCloudMonitorQuery{Metric: b.metric}), nil
+	return qcloudMonitorQuery(&metricquery.GenericQuery{Metric: b.metric}), nil
 }
 
-func qcloudMonitorQuery(query *metricquery.QCloudMonitorQuery) *metricquery.Query {
+func qcloudMonitorQuery(query *metricquery.GenericQuery) *metricquery.Query {
 	return &metricquery.Query{
-		Type:          metricquery.QCloudMonitorMetricSource,
-		QCloudMonitor: query,
+		Type:         metricquery.QCloudMonitorMetricSource,
+		GenericQuery: query,
 	}
 }
 

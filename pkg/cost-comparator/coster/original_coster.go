@@ -23,6 +23,12 @@ func (s *serverful) TotalCost(costerCtx *CosterContext) Cost {
 	nodeTotalCost := 0.
 	var realNodesNum int32 = 0
 	timespanInHour := float64(costerCtx.TimeSpanSeconds) / time.Hour.Seconds()
+	if costerCtx.NodesPrices == nil {
+		costerCtx.NodesPrices = make(map[string]*cloud.Prices)
+	}
+	if costerCtx.PodsPrices == nil {
+		costerCtx.PodsPrices = make(map[string]*cloud.Prices)
+	}
 	for name, nodeSpec := range costerCtx.NodesSpec {
 		if nodeSpec.VirtualNode {
 			continue
@@ -45,6 +51,13 @@ func (s *serverful) TotalCost(costerCtx *CosterContext) Cost {
 			klog.V(3).Infof("NodePrice is NaN. Setting to 0. node: %v, key: %v", name)
 			nodePrice = 0
 		}
+		prices, ok := costerCtx.NodesPrices[name]
+		if !ok {
+			prices = &cloud.Prices{}
+			costerCtx.NodesPrices[name] = prices
+		}
+		prices.TotalPrice = nodePrice
+
 		nodeTotalCost += nodePrice * timespanInHour
 	}
 
@@ -71,6 +84,13 @@ func (s *serverful) TotalCost(costerCtx *CosterContext) Cost {
 			klog.V(3).Infof("NodePrice is NaN. Setting to 0. node: %v, key: %v", name)
 			podPrice = 0
 		}
+		prices, ok := costerCtx.PodsPrices[name]
+		if !ok {
+			prices = &cloud.Prices{}
+			costerCtx.NodesPrices[name] = prices
+		}
+		prices.TotalPrice = podPrice
+
 		serverlessPodsTotalCost += podPrice * timespanInHour
 	}
 	serverfulPlatformCost := costerCtx.Pricer.PlatformPrice(cloud.PlatformParameter{Nodes: &realNodesNum, Platform: cloud.ServerfulKind})

@@ -10,13 +10,17 @@ import (
 // CosterContext used to compute cost given workload and node spec portrait, and time span, cloud pricer
 type CosterContext struct {
 	// time seconds
-	TimeSpanSeconds  int64
-	Discount         *float64
-	PodsSpec         map[string]spec.CloudPodSpec
-	NodesSpec        map[string]spec.CloudNodeSpec
-	WorkloadsSpec    map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ spec.CloudPodSpec
-	WorkloadsRecSpec map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ *spec.WorkloadRecommendedData
-	Pricer           cloud.Pricer
+	TimeSpanSeconds    int64
+	Discount           *float64
+	PodsSpec           map[string] /*namespace-name*/ spec.CloudPodSpec
+	PodsPrices         map[string] /*namespace-name*/ *cloud.Prices
+	NodesSpec          map[string] /*name*/ spec.CloudNodeSpec
+	NodesPrices        map[string] /*name*/ *cloud.Prices
+	WorkloadsSpec      map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ spec.CloudPodSpec
+	WorkloadsPrices    map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ *cloud.Prices
+	WorkloadsRecSpec   map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ *spec.WorkloadRecommendedData
+	WorkloadsRecPrices map[string] /*kind*/ map[types.NamespacedName] /*namespace-name*/ *cloud.WorkloadRecommendedPrice
+	Pricer             cloud.Pricer
 }
 
 type Cost struct {
