@@ -1,6 +1,7 @@
 package cost_comparator
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -32,8 +33,8 @@ func (c *Comparator) DoAnalysisV1() {
 	workloadsContainerRecdRawData := c.GetAllWorkloadContainersRecdRawData()
 
 	workloadInfos := MakeWorkloadInfos(workloadsSpec, workloadsContainerRecdRawData)
-	podInfos := MakePodInfos(podsSpec)
 	nodeInfos := MakeNodeInfos(c.baselineCloud, nodesSpec)
+	podInfos := MakePodInfos(podsSpec, nodesSpec, workloadsContainerRecdRawData)
 
 	workloadsDf := dataframe.LoadStructs(workloadInfos)
 	nodesDf := dataframe.LoadStructs(nodeInfos)
@@ -388,7 +389,7 @@ func MakeNodeInfos(price cloud.Pricer, nodes map[string] /*nodename*/ spec.Cloud
 	return nodeInfos
 }
 
-func MakePodInfos(pods map[string] /*namespace-name*/ spec.CloudPodSpec) []spec.PodInfo {
+func MakePodInfos(pods map[string] /*namespace-name*/ spec.CloudPodSpec, nodes map[string]spec.CloudNodeSpec, workloadRecContainers map[string]map[types.NamespacedName]*spec.RawRecdContainers) []spec.PodInfo {
 	var podInfos []spec.PodInfo
 	for nn, podSpec := range pods {
 		namespace, name, err := k8scache.SplitMetaNamespaceKey(nn)
@@ -397,17 +398,57 @@ func MakePodInfos(pods map[string] /*namespace-name*/ spec.CloudPodSpec) []spec.
 			continue
 		}
 
+		podLabels := podSpec.PodRef.GetLabels()
+		podLabelStr, _ := json.Marshal(podLabels)
+
+		nodeSpec, ok := nodes[podSpec.PodRef.Spec.NodeName]
+		podZone := ""
+		if ok {
+			podZone = nodeSpec.Zone
+		}
+
+		wkApiversion := podSpec.Workload.GetAPIVersion()
+		wkKind := podSpec.Workload.GetKind()
+		wkName := podSpec.Workload.GetName()
+
+		RawRecdCpuRequest := 0.0
+		RawRecdMemRequest := 0.0
+		RawRecdCpuLimit := 0.0
+		RawRecdMemLimit := 0.0
+		wkNN := types.NamespacedName{Namespace: namespace, Name: wkName}
+		kindWorkloadsRecContainers, ok := workloadRecContainers[wkKind]
+		if ok {
+			recContainers, ok := kindWorkloadsRecContainers[wkNN]
+			if ok {
+				for _, container := range recContainers.Containers {
+					RawRecdCpuRequest += container.RawRecdCpuRequest
+					RawRecdMemRequest += container.RawRecdMemRequest
+					RawRecdCpuLimit += container.RawRecdCpuLimit
+					RawRecdMemLimit += container.RawRecdMemLimit
+				}
+			}
+		}
+
 		podInfos = append(podInfos, spec.PodInfo{
 			Namespace:      namespace,
 			Name:           name,
+			WorkloadName: wkName,
+			WorkloadKind: wkKind,
+			WorkloadAPIVersion: wkApiversion,
 			OrigCpuRequest: float64(podSpec.Cpu.MilliValue()) / 1000,
 			OrigMemRequest: float64(podSpec.Mem.Value()) / consts.GB,
 			OrigCpuLimit:   float64(podSpec.CpuLimit.MilliValue()) / 1000,
 			OrigMemLimit:   float64(podSpec.MemLimit.Value()) / consts.GB,
+			RawRecdCpuRequest: RawRecdCpuRequest,
+			RawRecdMemRequest: RawRecdMemRequest,
+			RawRecdCpuLimit: RawRecdCpuLimit,
+			RawRecdMemLimit: RawRecdMemLimit,
 			QosClass:       string(podSpec.QoSClass),
 			NodeName:       podSpec.PodRef.Spec.NodeName,
 			Phase:          string(podSpec.PodRef.Status.Phase),
 			Serverless:     podSpec.Serverless,
+			Zone: podZone,
+			Labels: string(podLabelStr),
 		})
 	}
 	return podInfos

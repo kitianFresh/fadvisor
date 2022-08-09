@@ -96,6 +96,7 @@ type PodInfo struct {
 	RawRecdCpuLimit   float64
 	RawRecdMemLimit   float64
 
+	Zone         string
 	QosClass     string
 	NodeName     string
 	NodeInstance string
@@ -103,6 +104,7 @@ type PodInfo struct {
 	Reason       string
 	Phase        string
 	Serverless   bool
+	Labels       string
 }
 
 type WorkloadInfo struct {

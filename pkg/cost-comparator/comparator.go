@@ -153,9 +153,53 @@ func (c *Comparator) GetAllPodsSpec() map[string] /*namespace-name*/ spec.CloudP
 	res := make(map[string]spec.CloudPodSpec)
 	pods := c.clusterCache.GetPods()
 	pods = cache.FilterPendingFailedPods(pods)
-	for _, pod := range pods {
-		res[klog.KObj(pod).String()] = c.baselineCloud.Pod2Spec(pod)
+	var lock sync.Mutex
+	var wg sync.WaitGroup
+	podsChan := make(chan *v1.Pod, 10240)
+
+	setCloudPod := func(kind string, nn types.NamespacedName, podSpec spec.CloudPodSpec) {
+		lock.Lock()
+		defer lock.Unlock()
+		res[nn.String()] = podSpec
 	}
+
+	worker := func(i int) {
+		defer wg.Done()
+		for pod := range podsChan {
+			unstruct, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pod)
+			if err != nil {
+				klog.V(4).Info(err)
+				continue
+			}
+			rootUnstruct, err := ownerutil.FindRootOwner(context.TODO(), c.restMapper, c.kubeDynamicClient, &unstructured.Unstructured{Object: unstruct})
+			if err != nil {
+				klog.V(4).Info(err)
+				continue
+			}
+			kind := rootUnstruct.GetKind()
+
+			podSpec := c.baselineCloud.Pod2Spec(pod)
+
+			podSpec.Workload = rootUnstruct
+			setCloudPod(kind, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, podSpec)
+		}
+		klog.Infof("GetAllPodsSpec worker %v exit", i)
+	}
+
+	for i := 0; i < c.config.Workers; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+	for _, pod := range pods {
+		podsChan <- pod
+	}
+
+	close(podsChan)
+
+	wg.Wait()
+
+	klog.Infof("GetAllPodsSpec all worker finished")
+
 	return res
 }
 
